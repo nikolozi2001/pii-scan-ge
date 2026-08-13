@@ -103,4 +103,4 @@ Issue და PR მისასალმებელია. თუ შენს 
 
 ## ლიცენზია
 
-MIT
+MIT — იხ. [LICENSE](LICENSE)
