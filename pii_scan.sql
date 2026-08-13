@@ -59,7 +59,8 @@ CREATE TABLE #col (
     is_text         BIT,
     is_numeric_id   BIT,
     name_category   NVARCHAR(40)  NULL,
-    name_confidence TINYINT       NOT NULL DEFAULT 0
+    name_confidence TINYINT       NOT NULL DEFAULT 0,
+    name_is_special BIT           NOT NULL DEFAULT 0
 );
 
 CREATE TABLE #find (
@@ -203,7 +204,8 @@ best AS (
 )
 UPDATE c
    SET name_category   = b.category,
-       name_confidence = b.conf
+       name_confidence = b.conf,
+       name_is_special = b.is_special
 FROM #col c
 JOIN best b ON b.col_id = c.col_id AND b.rn = 1;
 
@@ -308,7 +310,11 @@ INSERT INTO #find (schema_name, table_name, column_name, data_type, approx_rows,
                    category, detected_by, sampled_rows, hit_pct, confidence, is_special)
 SELECT c.schema_name, c.table_name, c.column_name, c.data_type, c.approx_rows,
        c.name_category, N'NAME', 0, NULL, c.name_confidence,
-       CASE WHEN c.name_category LIKE N'%⚠%' THEN 1 ELSE 0 END
+       -- პატერნების ცხრილიდან გადმოტანილი ფლაგი.
+       -- კატეგორიის ტექსტში ⚠-ის ძებნა (LIKE N'%⚠%') აქ არ გამოდგება:
+       -- U+26A0-ს collation-ში სორტირების წონა არ აქვს, LIKE მას ყლაპავს
+       -- და პატერნი ყველა სტრიქონს ემთხვევა — ყველაფერი სპეციალური ხდებოდა.
+       c.name_is_special
 FROM #col c
 WHERE c.name_category IS NOT NULL;
 
