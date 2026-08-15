@@ -41,6 +41,9 @@ DECLARE @MinHitPct       DECIMAL(5,2)  = 5.00;  -- ზღვარი: მაჩ
 DECLARE @ScanData        BIT           = 1;     -- 0 = მხოლოდ სახელების ანალიზი (ძალიან სწრაფი)
 DECLARE @ScanAllStringCols BIT         = 1;     -- 1 = ყველა ტექსტური სვეტი, არა მხოლოდ სახელით ნაპოვნი
 DECLARE @MaxColumnsToScan INT          = 3000;  -- დაცვა უზარმაზარ ბაზებზე
+DECLARE @MinNameConfidence TINYINT     = 50;    -- ზღვარი სახელების ეტაპზე: ამაზე სუსტი დამთხვევა
+                                                -- არ იჩენს თავს. 0 = ყველაფერი გამოჩნდეს.
+                                                -- მონაცემით ნაპოვნს არ ეხება.
 
 --------------------------------------------------------------------------------
 -- 2. სამუშაო ცხრილები
@@ -58,6 +61,7 @@ CREATE TABLE #col (
     approx_rows     BIGINT,
     is_text         BIT,
     is_numeric_id   BIT,
+    is_likely_fk    BIT,          -- ციფრული სვეტი, სახელი ბოლოვდება „id"-ით
     name_category   NVARCHAR(40)  NULL,
     name_confidence TINYINT       NOT NULL DEFAULT 0,
     name_is_special BIT           NOT NULL DEFAULT 0
@@ -81,7 +85,7 @@ CREATE TABLE #find (
 -- 3. სვეტების ინვენტარიზაცია
 --------------------------------------------------------------------------------
 INSERT INTO #col (schema_name, table_name, column_name, data_type, max_length,
-                  approx_rows, is_text, is_numeric_id)
+                  approx_rows, is_text, is_numeric_id, is_likely_fk)
 SELECT
     s.name,
     t.name,
@@ -92,6 +96,12 @@ SELECT
     CASE WHEN ty.name IN ('char','nchar','varchar','nvarchar','text','ntext','sysname')
          THEN 1 ELSE 0 END,
     CASE WHEN ty.name IN ('bigint','numeric','decimal','int')
+         THEN 1 ELSE 0 END,
+    -- სავარაუდოდ უცხო/სუროგატული გასაღები: ციფრული ტიპი + სახელი „id"-ით მთავრდება.
+    -- ასეთი სვეტი პატერნს ხშირად ემთხვევა (PersonID, EmailAddressID, PhotoID),
+    -- მაგრამ პერსონალურ მონაცემს არ ინახავს — ანგარიშში ცალკე აღინიშნება.
+    CASE WHEN ty.name IN ('bigint','numeric','decimal','int','smallint','tinyint')
+              AND LOWER(c.name) LIKE '%id'
          THEN 1 ELSE 0 END
 FROM sys.columns  c
 JOIN sys.tables   t  ON t.object_id = c.object_id
@@ -116,7 +126,9 @@ WHERE t.is_ms_shipped = 0
       -- category                pattern                        conf  special
        (N'პირადი ნომერი',        N'%personal%num%',              90, 0),
        (N'პირადი ნომერი',        N'%personal%no%',               90, 0),
-       (N'პირადი ნომერი',        N'%pers%id%',                   80, 0),
+       -- 40: `PersonID` / `SalesPersonID` ტიპის FK-ებს იჭერს ისევე, როგორც
+       -- ნამდვილ `personal_id`-ს. ნამდვილს მონაცემის ეტაპი დაადასტურებს (11 ციფრი).
+       (N'პირადი ნომერი',        N'%pers%id%',                   40, 0),
        (N'პირადი ნომერი',        N'%piradi%',                    90, 0),
        (N'პირადი ნომერი',        N'%pid%',                       60, 0),
        (N'პირადი ნომერი',        N'%id_number%',                 85, 0),
@@ -183,7 +195,8 @@ WHERE t.is_ms_shipped = 0
        (N'ბიომეტრია ⚠',          N'%fingerprint%',               90, 1),
        (N'ბიომეტრია ⚠',          N'%biometr%',                   90, 1),
        (N'ბიომეტრია ⚠',          N'%face%id%',                   70, 1),
-       (N'ბიომეტრია ⚠',          N'%photo%',                     55, 1),
+       -- 40: პროდუქტის/დოკუმენტის ფოტოს სვეტებს ისევე იჭერს, როგორც ადამიანისას.
+       (N'ბიომეტრია ⚠',          N'%photo%',                     40, 1),
 
        (N'სენსიტიური ⚠',         N'%religio%',                   85, 1),
        (N'სენსიტიური ⚠',         N'%ethnic%',                    85, 1),
@@ -316,7 +329,8 @@ SELECT c.schema_name, c.table_name, c.column_name, c.data_type, c.approx_rows,
        -- და პატერნი ყველა სტრიქონს ემთხვევა — ყველაფერი სპეციალური ხდებოდა.
        c.name_is_special
 FROM #col c
-WHERE c.name_category IS NOT NULL;
+WHERE c.name_category IS NOT NULL
+  AND c.name_confidence >= @MinNameConfidence;
 
 --------------------------------------------------------------------------------
 -- 7. შედეგი #1 — კონსოლიდირებული აღმოჩენები
@@ -333,21 +347,29 @@ WHERE c.name_category IS NOT NULL;
 )
 SELECT
     N'1. აღმოჩენები' AS [ანგარიში],
-    schema_name AS [სქემა], table_name AS [ცხრილი], column_name AS [სვეტი],
-    data_type AS [ტიპი], approx_rows AS [მწკრივი], category AS [კატეგორია],
-    CASE WHEN by_name = 1 AND by_data = 1 THEN N'სახელი+მონაცემი'
-         WHEN by_data = 1 THEN N'მონაცემი'
+    a.schema_name AS [სქემა], a.table_name AS [ცხრილი], a.column_name AS [სვეტი],
+    a.data_type AS [ტიპი], a.approx_rows AS [მწკრივი], a.category AS [კატეგორია],
+    CASE WHEN a.by_name = 1 AND a.by_data = 1 THEN N'სახელი+მონაცემი'
+         WHEN a.by_data = 1 THEN N'მონაცემი'
          ELSE N'სახელი' END AS [აღმოჩენის წყარო],
-    hit_pct AS [დამთხვევა %],
-    CASE WHEN by_name = 1 AND by_data = 1 THEN 99 ELSE conf END AS [დარწმუნება],
-    CASE WHEN is_special = 1 THEN N'დიახ' ELSE N'' END AS [სპეციალური კატეგორია],
-    CASE WHEN is_special = 1 OR (by_name = 1 AND by_data = 1) THEN N'მაღალი'
-         WHEN conf >= 80 THEN N'საშუალო'
-         ELSE N'დაბალი' END AS [რისკი]
-FROM agg
-ORDER BY is_special DESC,
-         CASE WHEN by_name = 1 AND by_data = 1 THEN 0 ELSE 1 END,
-         conf DESC, approx_rows DESC;
+    a.hit_pct AS [დამთხვევა %],
+    CASE WHEN a.by_name = 1 AND a.by_data = 1 THEN 99 ELSE a.conf END AS [დარწმუნება],
+    CASE WHEN a.is_special = 1 THEN N'დიახ' ELSE N'' END AS [სპეციალური კატეგორია],
+    CASE WHEN a.is_special = 1 OR (a.by_name = 1 AND a.by_data = 1) THEN N'მაღალი'
+         WHEN a.conf >= 80 THEN N'საშუალო'
+         ELSE N'დაბალი' END AS [რისკი],
+    -- FK-ის ეჭვი მხოლოდ მაშინ ითქმის, თუ მონაცემმა თავად ვერაფერი დაადასტურა
+    CASE WHEN c.is_likely_fk = 1 AND a.by_data = 0
+         THEN N'სავარაუდოდ FK — შეამოწმე ხელით'
+         ELSE N'' END AS [შენიშვნა]
+FROM agg a
+LEFT JOIN #col c
+       ON c.schema_name = a.schema_name
+      AND c.table_name  = a.table_name
+      AND c.column_name = a.column_name
+ORDER BY a.is_special DESC,
+         CASE WHEN a.by_name = 1 AND a.by_data = 1 THEN 0 ELSE 1 END,
+         a.conf DESC, a.approx_rows DESC;
 
 --------------------------------------------------------------------------------
 -- 8. შედეგი #2 — შეჯამება კატეგორიების მიხედვით
