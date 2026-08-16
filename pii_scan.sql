@@ -445,10 +445,10 @@ BEGIN
         -- -1 = შემოწმება არ ჩატარებულა (არ არის 15/16 ციფრი), ანუ % 10 <> 0.
         CASE WHEN LEN(z.nv) IN (15,16) AND z.nv NOT LIKE ''%[^0-9]%'' THEN (
                 SELECT SUM(CASE WHEN (LEN(z.nv) - p.i) % 2 = 1
-                                THEN CASE WHEN CAST(SUBSTRING(z.nv,p.i,1) AS INT) * 2 > 9
-                                          THEN CAST(SUBSTRING(z.nv,p.i,1) AS INT) * 2 - 9
-                                          ELSE CAST(SUBSTRING(z.nv,p.i,1) AS INT) * 2 END
-                                ELSE CAST(SUBSTRING(z.nv,p.i,1) AS INT) END)
+                                THEN CASE WHEN TRY_CAST(SUBSTRING(z.nv,p.i,1) AS INT) * 2 > 9
+                                          THEN TRY_CAST(SUBSTRING(z.nv,p.i,1) AS INT) * 2 - 9
+                                          ELSE TRY_CAST(SUBSTRING(z.nv,p.i,1) AS INT) * 2 END
+                                ELSE TRY_CAST(SUBSTRING(z.nv,p.i,1) AS INT) END)
                 FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),
                              (9),(10),(11),(12),(13),(14),(15),(16)) p(i)
                 WHERE p.i <= LEN(z.nv) )
@@ -516,7 +516,9 @@ BEGIN
                 -- ერთი მოთხოვნა = ერთი ცხრილი, ანუ შეცდომა მთელ ცხრილს ეხება.
                 -- ეს არის სწრაფი რეჟიმის ფასი; @FastMode = 0 სვეტებს ცალკე არჩევს.
                 INSERT INTO #skipped (schema_name, table_name, column_name, reason, err)
-                SELECT @sch, @tbl, column_name, N'ERROR', LEFT(ERROR_MESSAGE(), 400)
+                SELECT @sch, @tbl, column_name, N'ERROR',
+                       LEFT(N'#' + CAST(ERROR_NUMBER() AS NVARCHAR(10)) + N': '
+                            + ERROR_MESSAGE(), 400)
                 FROM #col
                 WHERE to_scan = 1 AND schema_name = @sch AND table_name = @tbl;
             END CATCH
@@ -548,7 +550,9 @@ BEGIN
                 END TRY
                 BEGIN CATCH
                     INSERT INTO #skipped (schema_name, table_name, column_name, reason, err)
-                    VALUES (@sch, @tbl, @cln, N'ERROR', LEFT(ERROR_MESSAGE(), 400));
+                    VALUES (@sch, @tbl, @cln, N'ERROR',
+                            LEFT(N'#' + CAST(ERROR_NUMBER() AS NVARCHAR(10)) + N': '
+                                 + ERROR_MESSAGE(), 400));
                 END CATCH
                 FETCH NEXT FROM ccur INTO @cln;
             END
@@ -560,6 +564,19 @@ BEGIN
 
     CLOSE cur; DEALLOCATE cur;
     RAISERROR (N'დასკანერებული სვეტი: %d', 0, 1, @scanned) WITH NOWAIT;
+
+    ----------------------------------------------------------------------------
+    -- შეცდომის ტექსტიდან მნიშვნელობის ამოღება.
+    --
+    -- SQL Server-ის შეცდომა ხშირად თავად მონაცემს შეიცავს:
+    --   Conversion failed when converting the varchar value 'x@y.com' to int.
+    -- ეს კი არღვევს სკრიპტის მთავარ დაპირებას — რომ რეალურ მნიშვნელობას არ
+    -- აბრუნებს. ბრჭყალის შემდეგ ყველაფერი იჭრება; შეცდომის ნომერი რჩება,
+    -- ანუ დიაგნოსტიკა არ იკარგება.
+    ----------------------------------------------------------------------------
+    UPDATE #skipped
+       SET err = LEFT(err, CHARINDEX('''', err) - 1) + N'[მნიშვნელობა ამოღებულია]'
+     WHERE reason = N'ERROR' AND CHARINDEX('''', err) > 0;
 
     ----------------------------------------------------------------------------
     -- დათვლილი დამთხვევები → აღმოჩენები.

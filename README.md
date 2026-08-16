@@ -129,7 +129,7 @@ sqlcmd -S servername -d YourDatabase -i pii_scan.sql -o result.txt
 ## ⚠️ გაფრთხილებები
 
 - **გაუშვი replica-ზე ან არასამუშაო საათებში.** `WITH (NOLOCK)` გამოიყენება, მაგრამ დიდ ბაზაზე ათასობით `TOP N` მოთხოვნა მაინც დატვირთვაა.
-- **სკრიპტი მონაცემს არ ინახავს და არ გამოაქვს.** შედეგში მხოლოდ მეტამონაცემი და პროცენტული მაჩვენებელია — არცერთი რეალური მნიშვნელობა.
+- **სკრიპტი მონაცემს არ ინახავს და არ გამოაქვს.** შედეგში მხოლოდ მეტამონაცემი და პროცენტული მაჩვენებელია — არცერთი რეალური მნიშვნელობა. ზუსტი ფორმულირება: სამიზნე ბაზაში არც DDL და არც DML, მხოლოდ დროებითი ცხრილები `tempdb`-ში; ქსელში არაფერი გადის. იხ. [SECURITY.md](SECURITY.md).
 - **ეს არ არის იურიდიული დასკვნა.** ეს ინვენტარიზაციის ინსტრუმენტია. კლასიფიკაცია, სამართლებრივი საფუძვლის განსაზღვრა და RoPA-ს დასრულება ადამიანის საქმეა.
 - **False positive გარდაუვალია.** 11-ციფრიანი რიცხვი შეიძლება იყოს პირადი ნომერიც და ინვოისის ID-ც. `დარწმუნება = 99` ენიჭება მხოლოდ მაშინ, როცა სახელიც და მონაცემიც ერთდროულად ემთხვევა.
 - **უცხო გასაღებები ცალკეა მონიშნული.** ციფრული სვეტი, რომლის სახელიც `id`-ით მთავრდება (`EmailAddressID`, `PhoneNumberTypeID`), პატერნს ხშირად ემთხვევა, მაგრამ პერსონალურ მონაცემს არ ინახავს. ასეთს შენიშვნის სვეტში აწერია „სავარაუდოდ FK" — მაგრამ მხოლოდ მაშინ, თუ მონაცემმა თავად ვერაფერი დაადასტურა.
@@ -172,19 +172,61 @@ MIT — იხ. [LICENSE](LICENSE)
 
 ## English
 
+*The Georgian text above is authoritative. This section is a summary, not a translation — where the two disagree, the Georgian one is correct.*
+
 **A PII discovery script for MS SQL Server, tuned for Georgian data formats.**
 
-One `.sql` file. No dependencies. Writes nothing to the database.
+One `.sql` file. No dependencies. Writes nothing to the database being scanned.
 
-Georgia's Personal Data Protection Law (in force since 1 March 2024) requires organisations to know what personal data they process and where it lives. This script answers that in two stages:
+Georgia's Personal Data Protection Law (in force since 1 March 2024) requires organisations to know what personal data they process and where it lives. In practice nobody knows: the database has been growing for ten years and there is no documentation. This script answers the question in two stages.
 
-1. **Column-name heuristics** — around 70 patterns matched against `sys.columns`, covering both English names and Georgian transliterations (`piradi`, `gvari`, `misamart`, `janmrtel`, `nasamartl`). Reads no data; finishes in seconds.
-2. **Selective data sampling** — `TOP 500` rows per column, checked against Georgian formats: 11-digit personal number, `5XXXXXXXX` mobile, e-mail, `GE`-prefixed IBAN, card number, `AA000AA` licence plate. This catches columns whose names give nothing away (`col_17`, `data1`).
+**Stage 1 — column-name heuristics.** Around 80 patterns matched against `sys.columns`, covering English names and Georgian transliterations alike (`piradi`, `gvari`, `misamart`, `janmrtel`, `nasamartl`). Online identifiers — IP and MAC addresses, IMEI, device and session ids — have their own category, since the law counts them as personal data. Reads no data; finishes in seconds.
 
-It outputs three result sets: findings, a per-category summary, and a draft Record of Processing Activities (RoPA). Special-category data — health, biometrics, religion, ethnicity, criminal record, political opinion — is flagged separately, since it needs a different legal basis and often a DPIA.
+**Stage 2 — selective data sampling.** `TOP 500` rows per *table*, in a single pass: columns are unpivoted with `CROSS APPLY (VALUES …)`, so a table with 40 columns costs one query rather than 40. Half the sample is taken from each end of the clustered index, so a column whose contents changed over the years is not judged only on its oldest rows.
 
-**The script never stores or returns actual values** — only metadata and hit percentages.
+Values are normalised before matching — spaces, hyphens, brackets and dots are stripped — so `555 12 34 56`, `(555) 12-34-56` and `GE29 NB00 0000 0101 9049 17` all match. Formats checked: 11-digit personal number, Georgian mobile and Tbilisi landline, e-mail, `GE` IBAN, payment card (Luhn-validated, 16-digit and 15-digit Amex), `AA000AA` licence plate, IPv4. Two further checks look for an e-mail or phone number *embedded in free text*, which is how a `Comment` column usually leaks. This catches columns whose names give nothing away — `col_17`, `data1`, `field_b`.
 
-Requires SQL Server 2012+, and `VIEW DEFINITION` + `SELECT` on the target database. Run it against a read-only replica or outside business hours. It is an inventory tool, not legal advice; false positives are unavoidable and classification remains a human job.
+Sampling is pinned to `Latin1_General_BIN2`, so the same database gives the same answer on any server regardless of its collation.
+
+### Output
+
+Five result sets: findings, a per-category summary, a draft Record of Processing Activities (RoPA), a coverage report, and a list of skipped columns. The first three are built from one deduplicated set, so they cannot contradict each other.
+
+The coverage report exists for auditors. An empty result can mean "no PII here" or "I could not read it" — coverage tells you which, listing every column that was skipped and why. Evidence of what was checked matters as much as the findings themselves.
+
+Special-category data — health, biometrics, religion, ethnicity, criminal record, political opinion, sexual orientation — is flagged separately, since it needs a different legal basis and often a DPIA. Sex and citizenship are deliberately *not* in that group: they are ordinary personal data, and marking them special would put a DPIA warning on nearly every table in a typical HR database.
+
+**The script never stores or returns sampled values** — only metadata and hit percentages. See [SECURITY.md](SECURITY.md) for the precise guarantees.
+
+### Running it
+
+Requires SQL Server 2012+, and `VIEW DEFINITION` + `SELECT` on the target database — `db_datareader` plus `VIEW DEFINITION` is enough. There is no database parameter: the script runs against the current connection context, one database per run. Open it in SSMS, pick the database, press F5.
+
+Useful knobs at the top of the file:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `@SampleSize` | 500 | rows sampled per table |
+| `@MinHitPct` | 5.00 | percentage threshold |
+| `@MinAbsHits` | 3 | absolute threshold — this many matches report regardless of percentage |
+| `@ScanData` | 1 | 0 = name heuristics only, which takes seconds |
+| `@MaxColumnsToScan` | 3000 | guard for very large databases |
+| `@FastMode` | 1 | 1 = one query per table; 0 = one per column, slower but isolates failures |
+| `@MinNameConfidence` | 50 | threshold for the name stage; 0 shows everything |
+
+The two hit thresholds are OR'd. Existence matters more than prevalence in a compliance inventory: ten IBANs in 500 sampled rows is 2%, and also an incident.
+
+### Known limits
+
+- Sampling is not random. Both ends of the table are covered, the middle is not, so a heterogeneous column can still read as clean. False negatives are the worse failure here — you can re-check a false positive by hand, but you will never see a column that was missed.
+- Heap tables are sampled from the front only; ordering one would mean sorting the whole table.
+- Names inside free text are not detected — only e-mail addresses and phone numbers.
+- Values are truncated at 4000 characters.
+- Computed columns are checked by name but not by data.
+- Only tables are scanned — not views, not backups.
+- The personal-number check digit is deliberately **not** implemented. Until the algorithm can be confirmed from an official source, a guessed checksum would produce false negatives, which is the worst failure this tool can have.
+- RoPA row counts are records, not data subjects: a million rows in a transactions table may concern eight thousand people.
+
+False positives are unavoidable — an 11-digit number can be a personal number or an invoice id. Confidence reaches 99 only when the column name and the data agree. This is an inventory tool, not legal advice; classification and completing the RoPA remain a human job.
 
 Issues and pull requests are welcome. If it missed something in your database, or flagged far too much, share the pattern — the column name or format only, never the data.
