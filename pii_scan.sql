@@ -414,6 +414,7 @@ BEGIN
       SUM(CASE WHEN z.is_dec = 0 AND z.nv NOT LIKE ''%[^0-9]%''
                 AND (   (LEN(z.nv)=16 AND LEFT(z.nv,1) IN (''4'',''5'',''6''))
                      OR (LEN(z.nv)=15 AND LEFT(z.nv,2) IN (''34'',''37'')) )
+                AND l.luhn % 10 = 0
                THEN 1 ELSE 0 END),
       SUM(CASE WHEN LEN(z.nv)=7
                 AND z.nv LIKE ''[A-Za-z][A-Za-z][0-9][0-9][0-9][A-Za-z][A-Za-z]''
@@ -437,6 +438,22 @@ BEGIN
                   AND REPLACE(r.v, ''-'', '''') NOT LIKE ''%[^0-9.]%''
              THEN 1 ELSE 0 END
     )) AS z(nv, is_dec)
+    CROSS APPLY (VALUES (
+        -- Luhn (ISO/IEC 7812). მარჯვნიდან ყოველი მეორე ციფრი ორმაგდება;
+        -- 9-ზე მეტი ჯამი 9-ით მცირდება; საბოლოო ჯამი 10-ზე უნდა იყოფოდეს.
+        -- პოზიცია i მარცხნიდან ორმაგდება, როცა (LEN - i) კენტია.
+        -- -1 = შემოწმება არ ჩატარებულა (არ არის 15/16 ციფრი), ანუ % 10 <> 0.
+        CASE WHEN LEN(z.nv) IN (15,16) AND z.nv NOT LIKE ''%[^0-9]%'' THEN (
+                SELECT SUM(CASE WHEN (LEN(z.nv) - p.i) % 2 = 1
+                                THEN CASE WHEN CAST(SUBSTRING(z.nv,p.i,1) AS INT) * 2 > 9
+                                          THEN CAST(SUBSTRING(z.nv,p.i,1) AS INT) * 2 - 9
+                                          ELSE CAST(SUBSTRING(z.nv,p.i,1) AS INT) * 2 END
+                                ELSE CAST(SUBSTRING(z.nv,p.i,1) AS INT) END)
+                FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),
+                             (9),(10),(11),(12),(13),(14),(15),(16)) p(i)
+                WHERE p.i <= LEN(z.nv) )
+             ELSE -1 END
+    )) AS l(luhn)
     WHERE r.v IS NOT NULL AND r.v <> ''''
     GROUP BY r.colname;';
 
