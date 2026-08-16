@@ -284,19 +284,22 @@ BEGIN
         -- თავად ფორმატის ნაწილია, არა შემთხვევითი გამყოფი.
         SET @sql = N'
             SELECT @n = COUNT(*),
-              @h_pid   = SUM(CASE WHEN LEN(nv)=11 AND nv NOT LIKE ''%[^0-9]%'' THEN 1 ELSE 0 END),
-              @h_phone = SUM(CASE WHEN (LEN(nv)=9  AND nv LIKE ''5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
-                                    OR (LEN(nv)=12 AND nv LIKE ''9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
-                                    OR (LEN(nv)=13 AND nv LIKE ''+9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
-                                   THEN 1 ELSE 0 END),
+              @h_pid   = SUM(CASE WHEN is_dec = 0
+                                   AND LEN(nv)=11 AND nv NOT LIKE ''%[^0-9]%'' THEN 1 ELSE 0 END),
+              @h_phone = SUM(CASE WHEN is_dec = 0
+                                   AND (   (LEN(nv)=9  AND nv LIKE ''5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
+                                        OR (LEN(nv)=12 AND nv LIKE ''9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
+                                        OR (LEN(nv)=13 AND nv LIKE ''+9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'') )
+                                  THEN 1 ELSE 0 END),
               -- სტაციონარული, თბილისი: 32 + 7 ციფრი, ადგილობრივი ნაწილი 2-ით იწყება
-              @h_land  = SUM(CASE WHEN (LEN(nv)=9  AND nv LIKE ''322[0-9][0-9][0-9][0-9][0-9][0-9]'')
-                                    OR (LEN(nv)=10 AND nv LIKE ''0322[0-9][0-9][0-9][0-9][0-9][0-9]'')
-                                    OR (LEN(nv)=12 AND nv LIKE ''995322[0-9][0-9][0-9][0-9][0-9][0-9]'')
-                                    OR (LEN(nv)=13 AND nv LIKE ''+995322[0-9][0-9][0-9][0-9][0-9][0-9]'')
-                                   THEN 1 ELSE 0 END),
+              @h_land  = SUM(CASE WHEN is_dec = 0
+                                   AND (   (LEN(nv)=9  AND nv LIKE ''322[0-9][0-9][0-9][0-9][0-9][0-9]'')
+                                        OR (LEN(nv)=10 AND nv LIKE ''0322[0-9][0-9][0-9][0-9][0-9][0-9]'')
+                                        OR (LEN(nv)=12 AND nv LIKE ''995322[0-9][0-9][0-9][0-9][0-9][0-9]'')
+                                        OR (LEN(nv)=13 AND nv LIKE ''+995322[0-9][0-9][0-9][0-9][0-9][0-9]'') )
+                                  THEN 1 ELSE 0 END),
               -- 16 ციფრი 4/5/6-ით (Visa/MC/Discover) ან 15 ციფრი 34/37-ით (Amex)
-              @h_card  = SUM(CASE WHEN nv NOT LIKE ''%[^0-9]%''
+              @h_card  = SUM(CASE WHEN is_dec = 0 AND nv NOT LIKE ''%[^0-9]%''
                                    AND (   (LEN(nv)=16 AND LEFT(nv,1) IN (''4'',''5'',''6''))
                                         OR (LEN(nv)=15 AND LEFT(nv,2) IN (''34'',''37'')) )
                                   THEN 1 ELSE 0 END),
@@ -311,16 +314,25 @@ BEGIN
                                    AND nv LIKE ''[A-Z][A-Z][0-9][0-9][0-9][A-Z][A-Z]''
                                    THEN 1 ELSE 0 END),
               @h_mail  = SUM(CASE WHEN v LIKE ''%_@_%.__%'' AND v NOT LIKE ''% %'' THEN 1 ELSE 0 END),
-              @h_iban  = SUM(CASE WHEN LEN(v)=22 AND v LIKE ''GE[0-9][0-9][A-Z][A-Z]%'' THEN 1 ELSE 0 END),
+              -- nv-ზე: IBAN-ს ბლოკებად წერენ — ''GE29 NB00 0000 0101 9049 17''
+              @h_iban  = SUM(CASE WHEN LEN(nv)=22 AND nv LIKE ''GE[0-9][0-9][A-Z][A-Z]%'' THEN 1 ELSE 0 END),
               -- ტექსტში ჩადგმული: მთელი მნიშვნელობა კი არა, მისი ნაწილი ემთხვევა
               @h_emb_mail  = SUM(CASE WHEN v LIKE ''%[a-z0-9]@[a-z0-9]%.[a-z][a-z]%''
                                       THEN 1 ELSE 0 END),
-              @h_emb_phone = SUM(CASE WHEN nv LIKE ''%5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]%''
+              @h_emb_phone = SUM(CASE WHEN is_dec = 0
+                                       AND nv LIKE ''%5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]%''
                                       THEN 1 ELSE 0 END)
             FROM (
                 SELECT v,
                        REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
-                           v, '' '', ''''), ''-'', ''''), ''('', ''''), '')'', ''''), ''.'', '''') AS nv
+                           v, '' '', ''''), ''-'', ''''), ''('', ''''), '')'', ''''), ''.'', '''') AS nv,
+                       -- ათწილადი: მხოლოდ ციფრი, ზუსტად ერთი წერტილი,
+                       -- სურვილისამებრ ერთი მინუსი. ნორმალიზაცია წერტილს შლის და
+                       -- 5123456.78 ცხრაციფრიან „მობილურად" იქცეოდა — ეს ფლაგი ამას აჩერებს.
+                       CASE WHEN LEN(v) - LEN(REPLACE(v, ''.'', '''')) = 1
+                                 AND v NOT LIKE ''%-%-%''
+                                 AND REPLACE(v, ''-'', '''') NOT LIKE ''%[^0-9.]%''
+                            THEN 1 ELSE 0 END AS is_dec
                 FROM (
                     SELECT TOP (' + CAST(@SampleSize AS NVARCHAR(10)) + N')
                            LTRIM(RTRIM(CONVERT(NVARCHAR(4000), ' + QUOTENAME(@cln) + N'))) AS v
