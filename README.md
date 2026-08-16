@@ -108,6 +108,8 @@ sqlcmd -S servername -d YourDatabase -i pii_scan.sql -o result.txt
 
 ## შეზღუდვები
 
+- **ნიმუში შემთხვევითი არ არის.** `TOP 500` `ORDER BY`-ის გარეშე პირველ 500 არა-NULL მწკრივს იღებს სკანირების ფიზიკური რიგით. თუ სვეტი ჰეტეროგენულია — ძველ ჩანაწერებში ჩვეულებრივი ტექსტია, ახლებში კი ელფოსტა — ნიმუშში ძველი მოხვდება და სვეტი „სუფთად" ჩაითვლება. **ცრუ უარყოფითი უფრო საშიშია, ვიდრე ცრუ დადებითი:** false positive-ს ხელით გადაამოწმებ, გამოტოვებულ სვეტს კი ვერასდროს ნახავ. კრიტიკულ სვეტებზე გაზარდე `@SampleSize` ან ხელით შეამოწმე.
+- **იშვიათად შევსებული სვეტი ძვირი ჯდება.** თუ სვეტი თითქმის მთლიანად NULL-ია, `WHERE col IS NOT NULL`-ს 500 მნიშვნელობის საპოვნელად შეიძლება მთელი ცხრილის სკანირება დასჭირდეს. ეს ერთ-ერთი მიზეზია, რის გამოც replica ჯობია.
 - ქართული ტექსტის შიგნით სახელი/გვარი არ იძებნება — მხოლოდ სვეტის სახელით
 - Luhn ვალიდაცია ბარათის ნომერზე არ ხდება (მხოლოდ ფორმატი)
 - `varbinary` / `image` / `xml` სვეტები გამოტოვებულია
@@ -133,3 +135,24 @@ Issue და PR მისასალმებელია. თუ შენს 
 ## ლიცენზია
 
 MIT — იხ. [LICENSE](LICENSE)
+
+---
+
+## English
+
+**A PII discovery script for MS SQL Server, tuned for Georgian data formats.**
+
+One `.sql` file. No dependencies. Writes nothing to the database.
+
+Georgia's Personal Data Protection Law (in force since 1 March 2024) requires organisations to know what personal data they process and where it lives. This script answers that in two stages:
+
+1. **Column-name heuristics** — around 70 patterns matched against `sys.columns`, covering both English names and Georgian transliterations (`piradi`, `gvari`, `misamart`, `janmrtel`, `nasamartl`). Reads no data; finishes in seconds.
+2. **Selective data sampling** — `TOP 500` rows per column, checked against Georgian formats: 11-digit personal number, `5XXXXXXXX` mobile, e-mail, `GE`-prefixed IBAN, card number, `AA000AA` licence plate. This catches columns whose names give nothing away (`col_17`, `data1`).
+
+It outputs three result sets: findings, a per-category summary, and a draft Record of Processing Activities (RoPA). Special-category data — health, biometrics, religion, ethnicity, criminal record, political opinion — is flagged separately, since it needs a different legal basis and often a DPIA.
+
+**The script never stores or returns actual values** — only metadata and hit percentages.
+
+Requires SQL Server 2012+, and `VIEW DEFINITION` + `SELECT` on the target database. Run it against a read-only replica or outside business hours. It is an inventory tool, not legal advice; false positives are unavoidable and classification remains a human job.
+
+Issues and pull requests are welcome. If it missed something in your database, or flagged far too much, share the pattern — the column name or format only, never the data.
