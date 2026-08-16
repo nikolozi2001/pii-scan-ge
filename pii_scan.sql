@@ -228,16 +228,18 @@ JOIN best b ON b.col_id = c.col_id AND b.rn = 1;
 IF @ScanData = 1
 BEGIN
     DECLARE @sch SYSNAME, @tbl SYSNAME, @cln SYSNAME, @dt SYSNAME,
-            @rows BIGINT, @ncat NVARCHAR(40), @nconf TINYINT;
+            @rows BIGINT, @ncat NVARCHAR(40), @nconf TINYINT, @maxlen INT;
     DECLARE @sql NVARCHAR(MAX);
     DECLARE @n INT, @h_pid INT, @h_phone INT, @h_mail INT,
-            @h_iban INT, @h_card INT, @h_plate INT;
+            @h_iban INT, @h_card INT, @h_plate INT,
+            @h_emb_mail INT, @h_emb_phone INT;
+    DECLARE @is_long BIT;
     DECLARE @scanned INT = 0;
 
     DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
         SELECT TOP (@MaxColumnsToScan)
                schema_name, table_name, column_name, data_type,
-               approx_rows, name_category, name_confidence
+               approx_rows, name_category, name_confidence, max_length
         FROM #col
         WHERE approx_rows > 0
           AND (   (is_text = 1 AND @ScanAllStringCols = 1)
@@ -246,10 +248,14 @@ BEGIN
         ORDER BY name_confidence DESC, approx_rows DESC;
 
     OPEN cur;
-    FETCH NEXT FROM cur INTO @sch, @tbl, @cln, @dt, @rows, @ncat, @nconf;
+    FETCH NEXT FROM cur INTO @sch, @tbl, @cln, @dt, @rows, @ncat, @nconf, @maxlen;
 
     WHILE @@FETCH_STATUS = 0
     BEGIN
+        -- გრძელი ტექსტური სვეტი — მხოლოდ ასეთში ვეძებთ ტექსტში ჩადგმულ PII-ს.
+        -- max_length ბაიტებშია (nvarchar(50) → 100), -1 კი MAX ტიპს ნიშნავს.
+        SET @is_long = CASE WHEN @maxlen = -1 OR @maxlen > 100 THEN 1 ELSE 0 END;
+
         -- nv = ნორმალიზებული მნიშვნელობა: მოშორებულია გამყოფები, რომლითაც
         -- ციფრულ ფორმატებს რეალურ ბაზებში წერენ —
         --   ტელეფონი „555 12 34 56", „(555) 12-34-56", „+995 555 123456"
@@ -270,14 +276,19 @@ BEGIN
                                    AND nv LIKE ''[A-Z][A-Z][0-9][0-9][0-9][A-Z][A-Z]''
                                    THEN 1 ELSE 0 END),
               @h_mail  = SUM(CASE WHEN v LIKE ''%_@_%.__%'' AND v NOT LIKE ''% %'' THEN 1 ELSE 0 END),
-              @h_iban  = SUM(CASE WHEN LEN(v)=22 AND v LIKE ''GE[0-9][0-9][A-Z][A-Z]%'' THEN 1 ELSE 0 END)
+              @h_iban  = SUM(CASE WHEN LEN(v)=22 AND v LIKE ''GE[0-9][0-9][A-Z][A-Z]%'' THEN 1 ELSE 0 END),
+              -- ტექსტში ჩადგმული: მთელი მნიშვნელობა კი არა, მისი ნაწილი ემთხვევა
+              @h_emb_mail  = SUM(CASE WHEN v LIKE ''%[a-z0-9]@[a-z0-9]%.[a-z][a-z]%''
+                                      THEN 1 ELSE 0 END),
+              @h_emb_phone = SUM(CASE WHEN nv LIKE ''%5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]%''
+                                      THEN 1 ELSE 0 END)
             FROM (
                 SELECT v,
                        REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
                            v, '' '', ''''), ''-'', ''''), ''('', ''''), '')'', ''''), ''.'', '''') AS nv
                 FROM (
                     SELECT TOP (' + CAST(@SampleSize AS NVARCHAR(10)) + N')
-                           LTRIM(RTRIM(CONVERT(NVARCHAR(400), ' + QUOTENAME(@cln) + N'))) AS v
+                           LTRIM(RTRIM(CONVERT(NVARCHAR(4000), ' + QUOTENAME(@cln) + N'))) AS v
                     FROM ' + QUOTENAME(@sch) + N'.' + QUOTENAME(@tbl) + N' WITH (NOLOCK)
                     WHERE ' + QUOTENAME(@cln) + N' IS NOT NULL
                 ) y
@@ -288,10 +299,12 @@ BEGIN
             EXEC sp_executesql @sql,
                  N'@n INT OUTPUT, @h_pid INT OUTPUT, @h_phone INT OUTPUT,
                    @h_mail INT OUTPUT, @h_iban INT OUTPUT, @h_card INT OUTPUT,
-                   @h_plate INT OUTPUT',
+                   @h_plate INT OUTPUT, @h_emb_mail INT OUTPUT,
+                   @h_emb_phone INT OUTPUT',
                  @n=@n OUTPUT, @h_pid=@h_pid OUTPUT, @h_phone=@h_phone OUTPUT,
                  @h_mail=@h_mail OUTPUT, @h_iban=@h_iban OUTPUT, @h_card=@h_card OUTPUT,
-                 @h_plate=@h_plate OUTPUT;
+                 @h_plate=@h_plate OUTPUT, @h_emb_mail=@h_emb_mail OUTPUT,
+                 @h_emb_phone=@h_emb_phone OUTPUT;
         END TRY
         BEGIN CATCH
             SET @n = 0;   -- უფლების ან ტიპის პრობლემა — გამოვტოვოთ სვეტი
@@ -314,14 +327,21 @@ BEGIN
                     (N'ელფოსტა',       ISNULL(@h_mail,0)),
                     (N'ფინანსური',     ISNULL(@h_iban,0)),
                     (N'ფინანსური',     ISNULL(@h_card,0)),
-                    (N'ავტომობილი',    ISNULL(@h_plate,0))
+                    (N'ავტომობილი',    ISNULL(@h_plate,0)),
+                    -- ცალკე კატეგორიები: ტექსტში ჩადგმულ PII-ს განსხვავებული
+                    -- მასკირება და სამართლებრივი მოპყრობა სჭირდება.
+                    -- მხოლოდ გრძელ ტექსტურ სვეტებზე ითვლება.
+                    (N'ელფოსტა (ტექსტში)',
+                        CASE WHEN @is_long = 1 THEN ISNULL(@h_emb_mail,0)  ELSE 0 END),
+                    (N'ტელეფონი (ტექსტში)',
+                        CASE WHEN @is_long = 1 THEN ISNULL(@h_emb_phone,0) ELSE 0 END)
                  ) d(cat, hits)
             WHERE d.hits > 0
               AND 100.0 * d.hits / @n >= @MinHitPct;
         END
 
         SET @scanned += 1;
-        FETCH NEXT FROM cur INTO @sch, @tbl, @cln, @dt, @rows, @ncat, @nconf;
+        FETCH NEXT FROM cur INTO @sch, @tbl, @cln, @dt, @rows, @ncat, @nconf, @maxlen;
     END
 
     CLOSE cur; DEALLOCATE cur;
