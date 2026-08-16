@@ -38,6 +38,10 @@ SET NOCOUNT ON;
 --------------------------------------------------------------------------------
 DECLARE @SampleSize      INT           = 500;   -- რამდენი მწკრივი თითო სვეტზე
 DECLARE @MinHitPct       DECIMAL(5,2)  = 5.00;  -- ზღვარი: მაჩვენებელი ამაზე ქვემოთ იგნორდება
+DECLARE @MinAbsHits      INT           = 3;     -- აბსოლუტური ზღვარი: ამდენი დამთხვევა ყოველთვის
+                                                -- აისახება, პროცენტის მიუხედავად. კომპლაიენსში
+                                                -- მნიშვნელოვანია არსებობა, არა გავრცელება —
+                                                -- ერთი IBAN არასწორ სვეტში უკვე ინციდენტია.
 DECLARE @ScanData        BIT           = 1;     -- 0 = მხოლოდ სახელების ანალიზი (ძალიან სწრაფი)
 DECLARE @ScanAllStringCols BIT         = 1;     -- 1 = ყველა ტექსტური სვეტი, არა მხოლოდ სახელით ნაპოვნი
 DECLARE @MaxColumnsToScan INT          = 3000;  -- დაცვა უზარმაზარ ბაზებზე
@@ -178,6 +182,20 @@ WHERE t.is_ms_shipped = 0
        (N'ავტომობილი',           N'%plate%',                     80, 0),
        (N'ავტომობილი',           N'%vin%',                       70, 0),
 
+       -- ონლაინ იდენტიფიკატორი კანონით პერსონალური მონაცემია.
+       -- ყურადღება: LIKE-ში `_` ერთი ნებისმიერი სიმბოლოა, ანუ `%ip_addr%`
+       -- იჭერს `ip_addr`-საც და `ip-addr`-საც, მაგრამ `ipaddress`-ს — არა.
+       -- ამიტომ ორივე ვარიანტი ცალკეა ჩაწერილი.
+       (N'ონლაინ იდენტიფიკატორი', N'%ip_addr%',                  85, 0),
+       (N'ონლაინ იდენტიფიკატორი', N'%ipaddr%',                   85, 0),
+       (N'ონლაინ იდენტიფიკატორი', N'%client_ip%',                85, 0),
+       (N'ონლაინ იდენტიფიკატორი', N'%remote_ip%',                85, 0),
+       (N'ონლაინ იდენტიფიკატორი', N'%mac_addr%',                 85, 0),
+       (N'ონლაინ იდენტიფიკატორი', N'%macaddr%',                  85, 0),
+       (N'ონლაინ იდენტიფიკატორი', N'%imei%',                     90, 0),
+       (N'ონლაინ იდენტიფიკატორი', N'%device%id%',                75, 0),
+       (N'ონლაინ იდენტიფიკატორი', N'%session%id%',               70, 0),
+
        (N'გეოლოკაცია',           N'%latitude%',                  70, 0),
        (N'გეოლოკაცია',           N'%longitude%',                 70, 0),
        (N'გეოლოკაცია',           N'%gps%',                       70, 0),
@@ -232,7 +250,8 @@ BEGIN
     DECLARE @sql NVARCHAR(MAX);
     DECLARE @n INT, @h_pid INT, @h_phone INT, @h_mail INT,
             @h_iban INT, @h_card INT, @h_plate INT,
-            @h_emb_mail INT, @h_emb_phone INT;
+            @h_emb_mail INT, @h_emb_phone INT,
+            @h_land INT, @h_ip INT;
     DECLARE @is_long BIT;
     DECLARE @scanned INT = 0;
 
@@ -270,8 +289,24 @@ BEGIN
                                     OR (LEN(nv)=12 AND nv LIKE ''9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
                                     OR (LEN(nv)=13 AND nv LIKE ''+9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
                                    THEN 1 ELSE 0 END),
-              @h_card  = SUM(CASE WHEN LEN(nv)=16 AND nv NOT LIKE ''%[^0-9]%''
-                                   AND LEFT(nv,1) IN (''4'',''5'',''6'') THEN 1 ELSE 0 END),
+              -- სტაციონარული, თბილისი: 32 + 7 ციფრი, ადგილობრივი ნაწილი 2-ით იწყება
+              @h_land  = SUM(CASE WHEN (LEN(nv)=9  AND nv LIKE ''322[0-9][0-9][0-9][0-9][0-9][0-9]'')
+                                    OR (LEN(nv)=10 AND nv LIKE ''0322[0-9][0-9][0-9][0-9][0-9][0-9]'')
+                                    OR (LEN(nv)=12 AND nv LIKE ''995322[0-9][0-9][0-9][0-9][0-9][0-9]'')
+                                    OR (LEN(nv)=13 AND nv LIKE ''+995322[0-9][0-9][0-9][0-9][0-9][0-9]'')
+                                   THEN 1 ELSE 0 END),
+              -- 16 ციფრი 4/5/6-ით (Visa/MC/Discover) ან 15 ციფრი 34/37-ით (Amex)
+              @h_card  = SUM(CASE WHEN nv NOT LIKE ''%[^0-9]%''
+                                   AND (   (LEN(nv)=16 AND LEFT(nv,1) IN (''4'',''5'',''6''))
+                                        OR (LEN(nv)=15 AND LEFT(nv,2) IN (''34'',''37'')) )
+                                  THEN 1 ELSE 0 END),
+              -- IPv4: მხოლოდ ციფრი და წერტილი, ზუსტად სამი წერტილი.
+              -- v-ზე მოწმდება და არა nv-ზე — ნორმალიზაცია წერტილს შლის.
+              @h_ip    = SUM(CASE WHEN LEN(v) BETWEEN 7 AND 15
+                                   AND v NOT LIKE ''%[^0-9.]%''
+                                   AND LEN(v) - LEN(REPLACE(v, ''.'', '''')) = 3
+                                   AND v LIKE ''[0-9]%[0-9]''
+                                  THEN 1 ELSE 0 END),
               @h_plate = SUM(CASE WHEN LEN(nv)=7
                                    AND nv LIKE ''[A-Z][A-Z][0-9][0-9][0-9][A-Z][A-Z]''
                                    THEN 1 ELSE 0 END),
@@ -300,11 +335,13 @@ BEGIN
                  N'@n INT OUTPUT, @h_pid INT OUTPUT, @h_phone INT OUTPUT,
                    @h_mail INT OUTPUT, @h_iban INT OUTPUT, @h_card INT OUTPUT,
                    @h_plate INT OUTPUT, @h_emb_mail INT OUTPUT,
-                   @h_emb_phone INT OUTPUT',
+                   @h_emb_phone INT OUTPUT, @h_land INT OUTPUT,
+                   @h_ip INT OUTPUT',
                  @n=@n OUTPUT, @h_pid=@h_pid OUTPUT, @h_phone=@h_phone OUTPUT,
                  @h_mail=@h_mail OUTPUT, @h_iban=@h_iban OUTPUT, @h_card=@h_card OUTPUT,
                  @h_plate=@h_plate OUTPUT, @h_emb_mail=@h_emb_mail OUTPUT,
-                 @h_emb_phone=@h_emb_phone OUTPUT;
+                 @h_emb_phone=@h_emb_phone OUTPUT, @h_land=@h_land OUTPUT,
+                 @h_ip=@h_ip OUTPUT;
         END TRY
         BEGIN CATCH
             SET @n = 0;   -- უფლების ან ტიპის პრობლემა — გამოვტოვოთ სვეტი
@@ -324,6 +361,8 @@ BEGIN
             FROM (VALUES
                     (N'პირადი ნომერი', ISNULL(@h_pid,0)),
                     (N'ტელეფონი',      ISNULL(@h_phone,0)),
+                    (N'ტელეფონი',      ISNULL(@h_land,0)),
+                    (N'ონლაინ იდენტიფიკატორი', ISNULL(@h_ip,0)),
                     (N'ელფოსტა',       ISNULL(@h_mail,0)),
                     (N'ფინანსური',     ISNULL(@h_iban,0)),
                     (N'ფინანსური',     ISNULL(@h_card,0)),
@@ -337,7 +376,8 @@ BEGIN
                         CASE WHEN @is_long = 1 THEN ISNULL(@h_emb_phone,0) ELSE 0 END)
                  ) d(cat, hits)
             WHERE d.hits > 0
-              AND 100.0 * d.hits / @n >= @MinHitPct;
+              AND (   100.0 * d.hits / @n >= @MinHitPct
+                   OR d.hits >= @MinAbsHits );
         END
 
         SET @scanned += 1;
