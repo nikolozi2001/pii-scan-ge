@@ -45,6 +45,9 @@ DECLARE @MinAbsHits      INT           = 3;     -- აბსოლუტურ�
 DECLARE @ScanData        BIT           = 1;     -- 0 = მხოლოდ სახელების ანალიზი (ძალიან სწრაფი)
 DECLARE @ScanAllStringCols BIT         = 1;     -- 1 = ყველა ტექსტური სვეტი, არა მხოლოდ სახელით ნაპოვნი
 DECLARE @MaxColumnsToScan INT          = 3000;  -- დაცვა უზარმაზარ ბაზებზე
+DECLARE @FastMode        BIT           = 1;     -- 1 = ერთი მოთხოვნა ცხრილზე (ბევრად სწრაფი)
+                                                -- 0 = ერთი მოთხოვნა სვეტზე; ნელია, სამაგიეროდ
+                                                --     ერთი წაუკითხავი სვეტი მთელ ცხრილს არ აგდებს
 DECLARE @MinNameConfidence TINYINT     = 50;    -- ზღვარი სახელების ეტაპზე: ამაზე სუსტი დამთხვევა
                                                 -- არ იჩენს თავს. 0 = ყველაფერი გამოჩნდეს.
                                                 -- მონაცემით ნაპოვნს არ ეხება.
@@ -56,6 +59,8 @@ IF OBJECT_ID('tempdb..#col')     IS NOT NULL DROP TABLE #col;
 IF OBJECT_ID('tempdb..#find')    IS NOT NULL DROP TABLE #find;
 IF OBJECT_ID('tempdb..#agg')     IS NOT NULL DROP TABLE #agg;
 IF OBJECT_ID('tempdb..#skipped') IS NOT NULL DROP TABLE #skipped;
+IF OBJECT_ID('tempdb..#tbl')     IS NOT NULL DROP TABLE #tbl;
+IF OBJECT_ID('tempdb..#hits')    IS NOT NULL DROP TABLE #hits;
 
 CREATE TABLE #col (
     col_id          INT IDENTITY(1,1) PRIMARY KEY,
@@ -69,6 +74,7 @@ CREATE TABLE #col (
     is_numeric_id   BIT,
     is_likely_fk    BIT,          -- ციფრული სვეტი, სახელი ბოლოვდება „id"-ით
     is_computed     BIT,          -- გამოთვლადი: სახელით მოწმდება, მონაცემით არა
+    to_scan         BIT           NOT NULL DEFAULT 0,
     name_category   NVARCHAR(40)  NULL,
     name_confidence TINYINT       NOT NULL DEFAULT 0,
     name_is_special BIT           NOT NULL DEFAULT 0
@@ -103,6 +109,34 @@ CREATE TABLE #agg (
     hit_pct         DECIMAL(5,2),
     conf            TINYINT,
     is_special      INT
+);
+
+-- სასკანერო ცხრილები. order_col = კლასტერული ინდექსის პირველი სვეტი,
+-- ნიმუშის მეორე ნახევრის უკუმიმართულებით ასაღებად. heap-ზე NULL.
+CREATE TABLE #tbl (
+    tbl_id          INT IDENTITY(1,1) PRIMARY KEY,
+    schema_name     SYSNAME,
+    table_name      SYSNAME,
+    order_col       SYSNAME NULL
+);
+
+-- დათვლილი დამთხვევები თითო სვეტზე. n = რამდენი არაცარიელი მნიშვნელობა
+-- აღმოჩნდა ნიმუშში — ეს თავისთავად სასარგებლო მაჩვენებელია.
+CREATE TABLE #hits (
+    schema_name     SYSNAME,
+    table_name      SYSNAME,
+    column_name     SYSNAME,
+    n               INT,
+    h_pid           INT,
+    h_phone         INT,
+    h_land          INT,
+    h_mail          INT,
+    h_iban          INT,
+    h_card          INT,
+    h_plate         INT,
+    h_ip            INT,
+    h_emb_mail      INT,
+    h_emb_phone     INT
 );
 
 -- გამოტოვებული სვეტები: აუდიტს მოცვის მტკიცებულება სჭირდება, არა მხოლოდ
@@ -277,6 +311,13 @@ JOIN best b ON b.col_id = c.col_id AND b.rn = 1;
 
 --------------------------------------------------------------------------------
 -- 5. ეტაპი 2 — მონაცემის შერჩევითი სკანირება
+--
+--    ერთი გავლა ცხრილზე, არა ერთი გავლა სვეტზე. სვეტები CROSS APPLY (VALUES ...)
+--    -ით ვერტიკალურად იშლება, ანუ 40-სვეტიან ცხრილს 40 ცალკე TOP N ნაცვლად
+--    ერთი მოთხოვნა ხვდება.
+--
+--    გვერდითი ეფექტი: `n` ახლა თითო სვეტის რეალურ შევსებას ზომავს ნიმუშში,
+--    და `WHERE col IS NOT NULL`-ის მთელი ცხრილის სკანირება ქრება.
 --------------------------------------------------------------------------------
 DECLARE @scanned INT = 0;
 
@@ -284,8 +325,6 @@ IF @ScanData = 1
 BEGIN
     -- გამოთვლადი სვეტი მონაცემით არ სკანირდება: თითო მწკრივზე გამოსახულების
     -- იძულებით გამოთვლას ნიშნავს. სახელის ევრისტიკა მასზე მაინც მუშაობს.
-    -- ჩამონათვალი ემთხვევა კურსორის პირობას — ანუ ესენი სხვა შემთხვევაში
-    -- დასკანერდებოდა.
     INSERT INTO #skipped (schema_name, table_name, column_name, reason, err)
     SELECT schema_name, table_name, column_name, N'COMPUTED',
            N'გამოთვლადი სვეტი — მონაცემი არ წაკითხულა'
@@ -296,172 +335,242 @@ BEGIN
            OR name_category IS NOT NULL
            OR is_numeric_id = 1 );
 
-    DECLARE @sch SYSNAME, @tbl SYSNAME, @cln SYSNAME, @dt SYSNAME,
-            @rows BIGINT, @ncat NVARCHAR(40), @nconf TINYINT, @maxlen INT;
-    DECLARE @sql NVARCHAR(MAX);
-    DECLARE @n INT, @h_pid INT, @h_phone INT, @h_mail INT,
-            @h_iban INT, @h_card INT, @h_plate INT,
-            @h_emb_mail INT, @h_emb_phone INT,
-            @h_land INT, @h_ip INT;
-    DECLARE @is_long BIT;
+    -- სასკანერო სვეტების მონიშვნა (იგივე პირობა, ერთხელ)
+    UPDATE #col
+       SET to_scan = 1
+     WHERE approx_rows > 0
+       AND is_computed = 0
+       AND (   (is_text = 1 AND @ScanAllStringCols = 1)
+            OR name_category IS NOT NULL
+            OR is_numeric_id = 1 );
+
+    -- @MaxColumnsToScan-ის ზღვარი. დალაგება დეტერმინირებულია, რომ ზღვარზე
+    -- ყოველთვის ერთი და იგივე ნაკრები მოხვდეს.
+    WITH ranked AS (
+        SELECT col_id,
+               ROW_NUMBER() OVER (ORDER BY name_confidence DESC, approx_rows DESC,
+                                           schema_name, table_name, column_name) AS rn
+        FROM #col WHERE to_scan = 1
+    )
+    UPDATE c SET to_scan = 0
+    FROM #col c JOIN ranked r ON r.col_id = c.col_id
+    WHERE r.rn > @MaxColumnsToScan;
+
+    ----------------------------------------------------------------------------
+    -- სასკანერო ცხრილები + დალაგების სვეტი.
+    -- order_col = კლასტერული ინდექსის პირველი სვეტი. ნიმუშის მეორე ნახევარი
+    -- მისი მიხედვით უკუმიმართულებით აიღება — ჰეტეროგენულ სვეტზე ეს ცრუ
+    -- უარყოფითის მთავარ მიზეზს ხურავს. თუ ცხრილი heap-ია, order_col = NULL
+    -- და მეორე ნახევარი არ სრულდება: სორტირება მთელ ცხრილზე ძვირი ჯდება.
+    ----------------------------------------------------------------------------
+    INSERT INTO #tbl (schema_name, table_name, order_col)
+    SELECT c.schema_name, c.table_name, MAX(ic.name)
+    FROM #col c
+    OUTER APPLY (
+        SELECT TOP (1) sc.name
+        FROM sys.indexes i
+        JOIN sys.index_columns xc ON xc.object_id = i.object_id AND xc.index_id = i.index_id
+        JOIN sys.columns sc ON sc.object_id = xc.object_id AND sc.column_id = xc.column_id
+        WHERE i.object_id = OBJECT_ID(QUOTENAME(c.schema_name) + '.' + QUOTENAME(c.table_name))
+          AND i.index_id = 1 AND xc.key_ordinal = 1
+    ) ic
+    WHERE c.to_scan = 1
+    GROUP BY c.schema_name, c.table_name;
+
+    ----------------------------------------------------------------------------
+    -- შემოწმებების სია ერთხელ იწერება და ორივე რეჟიმში იგივეა.
+    -- r.v  — საწყისი მნიშვნელობა (COLLATE Latin1_General_BIN2)
+    -- z.nv — ნორმალიზებული: მოშორებულია ' ', '-', '(', ')', '.'
+    -- z.is_dec — სუფთა ათწილადი, ციფრულ ფორმატებში არ ითვლება
+    ----------------------------------------------------------------------------
+    DECLARE @checks NVARCHAR(MAX) = N'
+      SUM(CASE WHEN z.is_dec = 0 AND LEN(z.nv)=11
+                AND z.nv NOT LIKE ''%[^0-9]%'' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN z.is_dec = 0
+                AND (   (LEN(z.nv)=9  AND z.nv LIKE ''5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
+                     OR (LEN(z.nv)=12 AND z.nv LIKE ''9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
+                     OR (LEN(z.nv)=13 AND z.nv LIKE ''+9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'') )
+               THEN 1 ELSE 0 END),
+      SUM(CASE WHEN z.is_dec = 0
+                AND (   (LEN(z.nv)=9  AND z.nv LIKE ''322[0-9][0-9][0-9][0-9][0-9][0-9]'')
+                     OR (LEN(z.nv)=10 AND z.nv LIKE ''0322[0-9][0-9][0-9][0-9][0-9][0-9]'')
+                     OR (LEN(z.nv)=12 AND z.nv LIKE ''995322[0-9][0-9][0-9][0-9][0-9][0-9]'')
+                     OR (LEN(z.nv)=13 AND z.nv LIKE ''+995322[0-9][0-9][0-9][0-9][0-9][0-9]'') )
+               THEN 1 ELSE 0 END),
+      SUM(CASE WHEN r.v LIKE ''%_@_%.__%'' AND r.v NOT LIKE ''% %'' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN LEN(z.nv)=22
+                AND z.nv LIKE ''[Gg][Ee][0-9][0-9][A-Za-z][A-Za-z]%'' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN z.is_dec = 0 AND z.nv NOT LIKE ''%[^0-9]%''
+                AND (   (LEN(z.nv)=16 AND LEFT(z.nv,1) IN (''4'',''5'',''6''))
+                     OR (LEN(z.nv)=15 AND LEFT(z.nv,2) IN (''34'',''37'')) )
+               THEN 1 ELSE 0 END),
+      SUM(CASE WHEN LEN(z.nv)=7
+                AND z.nv LIKE ''[A-Za-z][A-Za-z][0-9][0-9][0-9][A-Za-z][A-Za-z]''
+               THEN 1 ELSE 0 END),
+      SUM(CASE WHEN LEN(r.v) BETWEEN 7 AND 15
+                AND r.v NOT LIKE ''%[^0-9.]%''
+                AND LEN(r.v) - LEN(REPLACE(r.v, ''.'', '''')) = 3
+                AND r.v LIKE ''[0-9]%[0-9]'' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN r.v LIKE ''%[A-Za-z0-9]@[A-Za-z0-9]%.[A-Za-z][A-Za-z]%''
+               THEN 1 ELSE 0 END),
+      SUM(CASE WHEN z.is_dec = 0
+                AND z.nv LIKE ''%5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]%''
+               THEN 1 ELSE 0 END)';
+
+    DECLARE @norm NVARCHAR(MAX) = N'
+    CROSS APPLY (VALUES (
+        REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+            r.v, '' '', ''''), ''-'', ''''), ''('', ''''), '')'', ''''), ''.'', ''''),
+        CASE WHEN LEN(r.v) - LEN(REPLACE(r.v, ''.'', '''')) = 1
+                  AND r.v NOT LIKE ''%-%-%''
+                  AND REPLACE(r.v, ''-'', '''') NOT LIKE ''%[^0-9.]%''
+             THEN 1 ELSE 0 END
+    )) AS z(nv, is_dec)
+    WHERE r.v IS NOT NULL AND r.v <> ''''
+    GROUP BY r.colname;';
+
+    DECLARE @sch SYSNAME, @tbl SYSNAME, @ordc SYSNAME, @tbl_id INT;
+    DECLARE @sql NVARCHAR(MAX), @cols NVARCHAR(MAX), @src NVARCHAR(MAX);
+    DECLARE @half NVARCHAR(10) = CAST(@SampleSize / 2 AS NVARCHAR(10));
+    DECLARE @full NVARCHAR(10) = CAST(@SampleSize AS NVARCHAR(10));
 
     DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
-        SELECT TOP (@MaxColumnsToScan)
-               schema_name, table_name, column_name, data_type,
-               approx_rows, name_category, name_confidence, max_length
-        FROM #col
-        WHERE approx_rows > 0
-          AND is_computed = 0
-          AND (   (is_text = 1 AND @ScanAllStringCols = 1)
-               OR name_category IS NOT NULL
-               OR is_numeric_id = 1 )
-        ORDER BY name_confidence DESC, approx_rows DESC, schema_name, table_name, column_name;
+        SELECT tbl_id, schema_name, table_name, order_col
+        FROM #tbl ORDER BY schema_name, table_name;
 
     OPEN cur;
-    FETCH NEXT FROM cur INTO @sch, @tbl, @cln, @dt, @rows, @ncat, @nconf, @maxlen;
+    FETCH NEXT FROM cur INTO @tbl_id, @sch, @tbl, @ordc;
 
     WHILE @@FETCH_STATUS = 0
     BEGIN
-        -- გრძელი ტექსტური სვეტი — მხოლოდ ასეთში ვეძებთ ტექსტში ჩადგმულ PII-ს.
-        -- max_length ბაიტებშია (nvarchar(50) → 100), -1 კი MAX ტიპს ნიშნავს.
-        SET @is_long = CASE WHEN @maxlen = -1 OR @maxlen > 100 THEN 1 ELSE 0 END;
+        -- ნიმუშის წყარო. order_col-ის არსებობისას ნახევარი ცხრილის დასაწყისიდან,
+        -- ნახევარი ბოლოდან — TOP N ORDER BY-ის გარეშე მხოლოდ ძველ მწკრივებს იღებს.
+        SET @src = CASE WHEN @ordc IS NULL THEN
+                N'(SELECT TOP (' + @full + N') * FROM ' + QUOTENAME(@sch) + N'.'
+                  + QUOTENAME(@tbl) + N' WITH (NOLOCK)) s'
+            ELSE
+                N'(SELECT * FROM (SELECT TOP (' + @half + N') * FROM ' + QUOTENAME(@sch) + N'.'
+                  + QUOTENAME(@tbl) + N' WITH (NOLOCK)) a
+                   UNION ALL
+                   SELECT * FROM (SELECT TOP (' + @half + N') * FROM ' + QUOTENAME(@sch) + N'.'
+                  + QUOTENAME(@tbl) + N' WITH (NOLOCK) ORDER BY ' + QUOTENAME(@ordc) + N' DESC) b) s'
+            END;
 
-        -- v ფიქსირდება Latin1_General_BIN2-ზე, რომ შედეგი სერვერის collation-ზე
-        -- არ იყოს დამოკიდებული. BIN2 რეგისტრმგრძნობიარეა, ამიტომ ასოთა
-        -- დიაპაზონები ორივე რეგისტრით წერია ([A-Za-z]) და არა [A-Z]-ით.
-        --
-        -- nv = ნორმალიზებული მნიშვნელობა: მოშორებულია გამყოფები, რომლითაც
-        -- ციფრულ ფორმატებს რეალურ ბაზებში წერენ —
-        --   ტელეფონი „555 12 34 56", „(555) 12-34-56", „+995 555 123456"
-        --   პირადი ნომერი „01001 012345"
-        --   ბარათი „4111-1111-1111-1111"
-        -- ელფოსტასა და IBAN-ს nv არ ეხება: იქ წერტილი და შუალედი
-        -- თავად ფორმატის ნაწილია, არა შემთხვევითი გამყოფი.
-        SET @sql = N'
-            SELECT @n = COUNT(*),
-              @h_pid   = SUM(CASE WHEN is_dec = 0
-                                   AND LEN(nv)=11 AND nv NOT LIKE ''%[^0-9]%'' THEN 1 ELSE 0 END),
-              @h_phone = SUM(CASE WHEN is_dec = 0
-                                   AND (   (LEN(nv)=9  AND nv LIKE ''5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
-                                        OR (LEN(nv)=12 AND nv LIKE ''9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
-                                        OR (LEN(nv)=13 AND nv LIKE ''+9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'') )
-                                  THEN 1 ELSE 0 END),
-              -- სტაციონარული, თბილისი: 32 + 7 ციფრი, ადგილობრივი ნაწილი 2-ით იწყება
-              @h_land  = SUM(CASE WHEN is_dec = 0
-                                   AND (   (LEN(nv)=9  AND nv LIKE ''322[0-9][0-9][0-9][0-9][0-9][0-9]'')
-                                        OR (LEN(nv)=10 AND nv LIKE ''0322[0-9][0-9][0-9][0-9][0-9][0-9]'')
-                                        OR (LEN(nv)=12 AND nv LIKE ''995322[0-9][0-9][0-9][0-9][0-9][0-9]'')
-                                        OR (LEN(nv)=13 AND nv LIKE ''+995322[0-9][0-9][0-9][0-9][0-9][0-9]'') )
-                                  THEN 1 ELSE 0 END),
-              -- 16 ციფრი 4/5/6-ით (Visa/MC/Discover) ან 15 ციფრი 34/37-ით (Amex)
-              @h_card  = SUM(CASE WHEN is_dec = 0 AND nv NOT LIKE ''%[^0-9]%''
-                                   AND (   (LEN(nv)=16 AND LEFT(nv,1) IN (''4'',''5'',''6''))
-                                        OR (LEN(nv)=15 AND LEFT(nv,2) IN (''34'',''37'')) )
-                                  THEN 1 ELSE 0 END),
-              -- IPv4: მხოლოდ ციფრი და წერტილი, ზუსტად სამი წერტილი.
-              -- v-ზე მოწმდება და არა nv-ზე — ნორმალიზაცია წერტილს შლის.
-              @h_ip    = SUM(CASE WHEN LEN(v) BETWEEN 7 AND 15
-                                   AND v NOT LIKE ''%[^0-9.]%''
-                                   AND LEN(v) - LEN(REPLACE(v, ''.'', '''')) = 3
-                                   AND v LIKE ''[0-9]%[0-9]''
-                                  THEN 1 ELSE 0 END),
-              @h_plate = SUM(CASE WHEN LEN(nv)=7
-                                   AND nv LIKE ''[A-Za-z][A-Za-z][0-9][0-9][0-9][A-Za-z][A-Za-z]''
-                                   THEN 1 ELSE 0 END),
-              @h_mail  = SUM(CASE WHEN v LIKE ''%_@_%.__%'' AND v NOT LIKE ''% %'' THEN 1 ELSE 0 END),
-              -- nv-ზე: IBAN-ს ბლოკებად წერენ — ''GE29 NB00 0000 0101 9049 17''
-              @h_iban  = SUM(CASE WHEN LEN(nv)=22
-                                   AND nv LIKE ''[Gg][Ee][0-9][0-9][A-Za-z][A-Za-z]%''
-                                  THEN 1 ELSE 0 END),
-              -- ტექსტში ჩადგმული: მთელი მნიშვნელობა კი არა, მისი ნაწილი ემთხვევა
-              @h_emb_mail  = SUM(CASE WHEN v LIKE ''%[A-Za-z0-9]@[A-Za-z0-9]%.[A-Za-z][A-Za-z]%''
-                                      THEN 1 ELSE 0 END),
-              @h_emb_phone = SUM(CASE WHEN is_dec = 0
-                                       AND nv LIKE ''%5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]%''
-                                      THEN 1 ELSE 0 END)
-            FROM (
-                SELECT v,
-                       REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
-                           v, '' '', ''''), ''-'', ''''), ''('', ''''), '')'', ''''), ''.'', '''') AS nv,
-                       -- ათწილადი: მხოლოდ ციფრი, ზუსტად ერთი წერტილი,
-                       -- სურვილისამებრ ერთი მინუსი. ნორმალიზაცია წერტილს შლის და
-                       -- 5123456.78 ცხრაციფრიან „მობილურად" იქცეოდა — ეს ფლაგი ამას აჩერებს.
-                       CASE WHEN LEN(v) - LEN(REPLACE(v, ''.'', '''')) = 1
-                                 AND v NOT LIKE ''%-%-%''
-                                 AND REPLACE(v, ''-'', '''') NOT LIKE ''%[^0-9.]%''
-                            THEN 1 ELSE 0 END AS is_dec
-                FROM (
-                    SELECT TOP (' + CAST(@SampleSize AS NVARCHAR(10)) + N')
-                           LTRIM(RTRIM(CONVERT(NVARCHAR(4000), ' + QUOTENAME(@cln) + N')))
-                               COLLATE Latin1_General_BIN2 AS v
-                    FROM ' + QUOTENAME(@sch) + N'.' + QUOTENAME(@tbl) + N' WITH (NOLOCK)
-                    WHERE ' + QUOTENAME(@cln) + N' IS NOT NULL
-                ) y
-                WHERE v <> ''''
-            ) x;';
-
-        BEGIN TRY
-            EXEC sp_executesql @sql,
-                 N'@n INT OUTPUT, @h_pid INT OUTPUT, @h_phone INT OUTPUT,
-                   @h_mail INT OUTPUT, @h_iban INT OUTPUT, @h_card INT OUTPUT,
-                   @h_plate INT OUTPUT, @h_emb_mail INT OUTPUT,
-                   @h_emb_phone INT OUTPUT, @h_land INT OUTPUT,
-                   @h_ip INT OUTPUT',
-                 @n=@n OUTPUT, @h_pid=@h_pid OUTPUT, @h_phone=@h_phone OUTPUT,
-                 @h_mail=@h_mail OUTPUT, @h_iban=@h_iban OUTPUT, @h_card=@h_card OUTPUT,
-                 @h_plate=@h_plate OUTPUT, @h_emb_mail=@h_emb_mail OUTPUT,
-                 @h_emb_phone=@h_emb_phone OUTPUT, @h_land=@h_land OUTPUT,
-                 @h_ip=@h_ip OUTPUT;
-        END TRY
-        BEGIN CATCH
-            -- უფლების ან ტიპის პრობლემა. სვეტს ვტოვებთ, მაგრამ ჩუმად აღარ —
-            -- გამოტოვებული სვეტი ანგარიშში ცალკე გამოდის.
-            SET @n = 0;
-            INSERT INTO #skipped (schema_name, table_name, column_name, reason, err)
-            VALUES (@sch, @tbl, @cln, N'ERROR', LEFT(ERROR_MESSAGE(), 400));
-        END CATCH
-
-        IF ISNULL(@n,0) > 0
+        -- @FastMode = 1: ცხრილის ყველა სვეტი ერთ მოთხოვნაში.
+        -- @FastMode = 0: თითო სვეტი ცალკე — ნელია, სამაგიეროდ ერთი წაუკითხავი
+        --                სვეტი მთელ ცხრილს არ აგდებს.
+        IF @FastMode = 1
         BEGIN
-            INSERT INTO #find (schema_name, table_name, column_name, data_type,
-                               approx_rows, category, detected_by, sampled_rows,
-                               hit_pct, confidence, is_special)
-            SELECT @sch, @tbl, @cln, @dt, @rows, d.cat, N'DATA', @n,
-                   CAST(100.0 * d.hits / @n AS DECIMAL(5,2)),
-                   CASE WHEN 100.0 * d.hits / @n >= 80 THEN 95
-                        WHEN 100.0 * d.hits / @n >= 40 THEN 80
-                        ELSE 60 END,
-                   0
-            FROM (VALUES
-                    (N'პირადი ნომერი', ISNULL(@h_pid,0)),
-                    (N'ტელეფონი',      ISNULL(@h_phone,0)),
-                    (N'ტელეფონი',      ISNULL(@h_land,0)),
-                    (N'ონლაინ იდენტიფიკატორი', ISNULL(@h_ip,0)),
-                    (N'ელფოსტა',       ISNULL(@h_mail,0)),
-                    (N'ფინანსური',     ISNULL(@h_iban,0)),
-                    (N'ფინანსური',     ISNULL(@h_card,0)),
-                    (N'ავტომობილი',    ISNULL(@h_plate,0)),
-                    -- ცალკე კატეგორიები: ტექსტში ჩადგმულ PII-ს განსხვავებული
-                    -- მასკირება და სამართლებრივი მოპყრობა სჭირდება.
-                    -- მხოლოდ გრძელ ტექსტურ სვეტებზე ითვლება.
-                    (N'ელფოსტა (ტექსტში)',
-                        CASE WHEN @is_long = 1 THEN ISNULL(@h_emb_mail,0)  ELSE 0 END),
-                    (N'ტელეფონი (ტექსტში)',
-                        CASE WHEN @is_long = 1 THEN ISNULL(@h_emb_phone,0) ELSE 0 END)
-                 ) d(cat, hits)
-            WHERE d.hits > 0
-              AND (   100.0 * d.hits / @n >= @MinHitPct
-                   OR d.hits >= @MinAbsHits );
+            SET @cols = STUFF((
+                SELECT N',(N' + QUOTENAME(c.column_name, '''') + N', LTRIM(RTRIM(CONVERT(NVARCHAR(4000), s.'
+                       + QUOTENAME(c.column_name) + N'))) COLLATE Latin1_General_BIN2)'
+                FROM #col c
+                WHERE c.to_scan = 1 AND c.schema_name = @sch AND c.table_name = @tbl
+                ORDER BY c.column_name
+                FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 1, '');
+
+            SET @sql = N'SELECT N' + QUOTENAME(@sch, '''') + N', N' + QUOTENAME(@tbl, '''')
+                     + N', r.colname, COUNT(*),' + @checks
+                     + N' FROM ' + @src
+                     + N' CROSS APPLY (VALUES ' + @cols + N') AS r(colname, v)'
+                     + @norm;
+
+            BEGIN TRY
+                INSERT INTO #hits (schema_name, table_name, column_name, n,
+                                   h_pid, h_phone, h_land, h_mail, h_iban,
+                                   h_card, h_plate, h_ip, h_emb_mail, h_emb_phone)
+                EXEC sp_executesql @sql;
+
+                SET @scanned += (SELECT COUNT(*) FROM #col
+                                 WHERE to_scan = 1 AND schema_name = @sch AND table_name = @tbl);
+            END TRY
+            BEGIN CATCH
+                -- ერთი მოთხოვნა = ერთი ცხრილი, ანუ შეცდომა მთელ ცხრილს ეხება.
+                -- ეს არის სწრაფი რეჟიმის ფასი; @FastMode = 0 სვეტებს ცალკე არჩევს.
+                INSERT INTO #skipped (schema_name, table_name, column_name, reason, err)
+                SELECT @sch, @tbl, column_name, N'ERROR', LEFT(ERROR_MESSAGE(), 400)
+                FROM #col
+                WHERE to_scan = 1 AND schema_name = @sch AND table_name = @tbl;
+            END CATCH
+        END
+        ELSE
+        BEGIN
+            DECLARE @cln SYSNAME;
+            DECLARE ccur CURSOR LOCAL FAST_FORWARD FOR
+                SELECT column_name FROM #col
+                WHERE to_scan = 1 AND schema_name = @sch AND table_name = @tbl
+                ORDER BY column_name;
+            OPEN ccur;
+            FETCH NEXT FROM ccur INTO @cln;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                SET @sql = N'SELECT N' + QUOTENAME(@sch, '''') + N', N' + QUOTENAME(@tbl, '''')
+                         + N', r.colname, COUNT(*),' + @checks
+                         + N' FROM ' + @src
+                         + N' CROSS APPLY (VALUES (N' + QUOTENAME(@cln, '''')
+                         + N', LTRIM(RTRIM(CONVERT(NVARCHAR(4000), s.' + QUOTENAME(@cln)
+                         + N'))) COLLATE Latin1_General_BIN2)) AS r(colname, v)'
+                         + @norm;
+                BEGIN TRY
+                    INSERT INTO #hits (schema_name, table_name, column_name, n,
+                                       h_pid, h_phone, h_land, h_mail, h_iban,
+                                       h_card, h_plate, h_ip, h_emb_mail, h_emb_phone)
+                    EXEC sp_executesql @sql;
+                    SET @scanned += 1;
+                END TRY
+                BEGIN CATCH
+                    INSERT INTO #skipped (schema_name, table_name, column_name, reason, err)
+                    VALUES (@sch, @tbl, @cln, N'ERROR', LEFT(ERROR_MESSAGE(), 400));
+                END CATCH
+                FETCH NEXT FROM ccur INTO @cln;
+            END
+            CLOSE ccur; DEALLOCATE ccur;
         END
 
-        SET @scanned += 1;
-        FETCH NEXT FROM cur INTO @sch, @tbl, @cln, @dt, @rows, @ncat, @nconf, @maxlen;
+        FETCH NEXT FROM cur INTO @tbl_id, @sch, @tbl, @ordc;
     END
 
     CLOSE cur; DEALLOCATE cur;
     RAISERROR (N'დასკანერებული სვეტი: %d', 0, 1, @scanned) WITH NOWAIT;
-END
 
+    ----------------------------------------------------------------------------
+    -- დათვლილი დამთხვევები → აღმოჩენები.
+    -- ტექსტში ჩადგმულის შემოწმება მხოლოდ გრძელ სვეტს ეხება — გადაწყვეტილება
+    -- აქ მიიღება, რადგან სიგრძე თითო სვეტისაა და მოთხოვნა ცხრილისა.
+    ----------------------------------------------------------------------------
+    INSERT INTO #find (schema_name, table_name, column_name, data_type,
+                       approx_rows, category, detected_by, sampled_rows,
+                       hit_pct, confidence, is_special)
+    SELECT h.schema_name, h.table_name, h.column_name, c.data_type, c.approx_rows,
+           d.cat, N'DATA', h.n,
+           CAST(100.0 * d.hits / h.n AS DECIMAL(5,2)),
+           CASE WHEN 100.0 * d.hits / h.n >= 80 THEN 95
+                WHEN 100.0 * d.hits / h.n >= 40 THEN 80
+                ELSE 60 END,
+           0
+    FROM #hits h
+    JOIN #col c ON c.schema_name = h.schema_name
+               AND c.table_name  = h.table_name
+               AND c.column_name = h.column_name
+    CROSS APPLY (VALUES
+            (N'პირადი ნომერი',        h.h_pid),
+            (N'ტელეფონი',             h.h_phone),
+            (N'ტელეფონი',             h.h_land),
+            (N'ელფოსტა',              h.h_mail),
+            (N'ფინანსური',            h.h_iban),
+            (N'ფინანსური',            h.h_card),
+            (N'ავტომობილი',           h.h_plate),
+            (N'ონლაინ იდენტიფიკატორი', h.h_ip),
+            (N'ელფოსტა (ტექსტში)',
+                CASE WHEN c.max_length = -1 OR c.max_length > 100 THEN h.h_emb_mail ELSE 0 END),
+            (N'ტელეფონი (ტექსტში)',
+                CASE WHEN c.max_length = -1 OR c.max_length > 100 THEN h.h_emb_phone ELSE 0 END)
+         ) d(cat, hits)
+    WHERE h.n > 0
+      AND d.hits > 0
+      AND (   100.0 * d.hits / h.n >= @MinHitPct
+           OR d.hits >= @MinAbsHits );
+END
 --------------------------------------------------------------------------------
 -- 6. სახელით ნაპოვნის დამატება
 --------------------------------------------------------------------------------
