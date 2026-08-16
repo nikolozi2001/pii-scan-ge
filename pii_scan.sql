@@ -52,8 +52,10 @@ DECLARE @MinNameConfidence TINYINT     = 50;    -- ზღვარი სახ�
 --------------------------------------------------------------------------------
 -- 2. სამუშაო ცხრილები
 --------------------------------------------------------------------------------
-IF OBJECT_ID('tempdb..#col')  IS NOT NULL DROP TABLE #col;
-IF OBJECT_ID('tempdb..#find') IS NOT NULL DROP TABLE #find;
+IF OBJECT_ID('tempdb..#col')     IS NOT NULL DROP TABLE #col;
+IF OBJECT_ID('tempdb..#find')    IS NOT NULL DROP TABLE #find;
+IF OBJECT_ID('tempdb..#agg')     IS NOT NULL DROP TABLE #agg;
+IF OBJECT_ID('tempdb..#skipped') IS NOT NULL DROP TABLE #skipped;
 
 CREATE TABLE #col (
     col_id          INT IDENTITY(1,1) PRIMARY KEY,
@@ -66,6 +68,7 @@ CREATE TABLE #col (
     is_text         BIT,
     is_numeric_id   BIT,
     is_likely_fk    BIT,          -- ციფრული სვეტი, სახელი ბოლოვდება „id"-ით
+    is_computed     BIT,          -- გამოთვლადი: სახელით მოწმდება, მონაცემით არა
     name_category   NVARCHAR(40)  NULL,
     name_confidence TINYINT       NOT NULL DEFAULT 0,
     name_is_special BIT           NOT NULL DEFAULT 0
@@ -85,11 +88,38 @@ CREATE TABLE #find (
     is_special      BIT                -- სპეციალური კატეგორიის მონაცემი
 );
 
+-- დედუპლიცირებული აღმოჩენები. სამივე ანგარიში ამ ერთ ცხრილზე დგება, რომ
+-- ერთმანეთს არ დაუპირისპირდნენ: #find-ში ერთი სვეტი ორჯერ წერია, თუ
+-- სახელითაც და მონაცემითაც მოიძებნა.
+CREATE TABLE #agg (
+    schema_name     SYSNAME,
+    table_name      SYSNAME,
+    column_name     SYSNAME,
+    data_type       SYSNAME,
+    approx_rows     BIGINT,
+    category        NVARCHAR(40),
+    by_name         INT,
+    by_data         INT,
+    hit_pct         DECIMAL(5,2),
+    conf            TINYINT,
+    is_special      INT
+);
+
+-- გამოტოვებული სვეტები: აუდიტს მოცვის მტკიცებულება სჭირდება, არა მხოლოდ
+-- აღმოჩენები. ცარიელი შედეგი „PII არ არის" და „ვერ წავიკითხე" ერთნაირად გამოიყურება.
+CREATE TABLE #skipped (
+    schema_name     SYSNAME,
+    table_name      SYSNAME,
+    column_name     SYSNAME,
+    reason          NVARCHAR(20),      -- ERROR | COMPUTED
+    err             NVARCHAR(400)
+);
+
 --------------------------------------------------------------------------------
 -- 3. სვეტების ინვენტარიზაცია
 --------------------------------------------------------------------------------
 INSERT INTO #col (schema_name, table_name, column_name, data_type, max_length,
-                  approx_rows, is_text, is_numeric_id, is_likely_fk)
+                  approx_rows, is_text, is_numeric_id, is_likely_fk, is_computed)
 SELECT
     s.name,
     t.name,
@@ -106,7 +136,8 @@ SELECT
     -- მაგრამ პერსონალურ მონაცემს არ ინახავს — ანგარიშში ცალკე აღინიშნება.
     CASE WHEN ty.name IN ('bigint','numeric','decimal','int','smallint','tinyint')
               AND LOWER(c.name) LIKE '%id'
-         THEN 1 ELSE 0 END
+         THEN 1 ELSE 0 END,
+    c.is_computed
 FROM sys.columns  c
 JOIN sys.tables   t  ON t.object_id = c.object_id
 JOIN sys.schemas  s  ON s.schema_id = t.schema_id
@@ -229,7 +260,11 @@ WHERE t.is_ms_shipped = 0
 ),
 best AS (
     SELECT c.col_id, p.category, p.conf, p.is_special,
-           ROW_NUMBER() OVER (PARTITION BY c.col_id ORDER BY p.conf DESC) AS rn
+           -- tiebreak აუცილებელია: `health_icd_code` ორივეს ემთხვევა — %health% (75)
+           -- და %icd% (75). მხოლოდ conf-ით დალაგება არჩევანს არადეტერმინირებულს
+           -- ხდის და იდენტური ბაზა გაშვებებს შორის სხვადასხვა შედეგს იძლევა.
+           ROW_NUMBER() OVER (PARTITION BY c.col_id
+                              ORDER BY p.conf DESC, p.category, p.pattern) AS rn
     FROM #col c
     JOIN pat p ON LOWER(REPLACE(c.column_name, ' ', '_')) LIKE p.pattern
 )
@@ -243,8 +278,24 @@ JOIN best b ON b.col_id = c.col_id AND b.rn = 1;
 --------------------------------------------------------------------------------
 -- 5. ეტაპი 2 — მონაცემის შერჩევითი სკანირება
 --------------------------------------------------------------------------------
+DECLARE @scanned INT = 0;
+
 IF @ScanData = 1
 BEGIN
+    -- გამოთვლადი სვეტი მონაცემით არ სკანირდება: თითო მწკრივზე გამოსახულების
+    -- იძულებით გამოთვლას ნიშნავს. სახელის ევრისტიკა მასზე მაინც მუშაობს.
+    -- ჩამონათვალი ემთხვევა კურსორის პირობას — ანუ ესენი სხვა შემთხვევაში
+    -- დასკანერდებოდა.
+    INSERT INTO #skipped (schema_name, table_name, column_name, reason, err)
+    SELECT schema_name, table_name, column_name, N'COMPUTED',
+           N'გამოთვლადი სვეტი — მონაცემი არ წაკითხულა'
+    FROM #col
+    WHERE is_computed = 1
+      AND approx_rows > 0
+      AND (   (is_text = 1 AND @ScanAllStringCols = 1)
+           OR name_category IS NOT NULL
+           OR is_numeric_id = 1 );
+
     DECLARE @sch SYSNAME, @tbl SYSNAME, @cln SYSNAME, @dt SYSNAME,
             @rows BIGINT, @ncat NVARCHAR(40), @nconf TINYINT, @maxlen INT;
     DECLARE @sql NVARCHAR(MAX);
@@ -253,7 +304,6 @@ BEGIN
             @h_emb_mail INT, @h_emb_phone INT,
             @h_land INT, @h_ip INT;
     DECLARE @is_long BIT;
-    DECLARE @scanned INT = 0;
 
     DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
         SELECT TOP (@MaxColumnsToScan)
@@ -261,10 +311,11 @@ BEGIN
                approx_rows, name_category, name_confidence, max_length
         FROM #col
         WHERE approx_rows > 0
+          AND is_computed = 0
           AND (   (is_text = 1 AND @ScanAllStringCols = 1)
                OR name_category IS NOT NULL
                OR is_numeric_id = 1 )
-        ORDER BY name_confidence DESC, approx_rows DESC;
+        ORDER BY name_confidence DESC, approx_rows DESC, schema_name, table_name, column_name;
 
     OPEN cur;
     FETCH NEXT FROM cur INTO @sch, @tbl, @cln, @dt, @rows, @ncat, @nconf, @maxlen;
@@ -275,6 +326,10 @@ BEGIN
         -- max_length ბაიტებშია (nvarchar(50) → 100), -1 კი MAX ტიპს ნიშნავს.
         SET @is_long = CASE WHEN @maxlen = -1 OR @maxlen > 100 THEN 1 ELSE 0 END;
 
+        -- v ფიქსირდება Latin1_General_BIN2-ზე, რომ შედეგი სერვერის collation-ზე
+        -- არ იყოს დამოკიდებული. BIN2 რეგისტრმგრძნობიარეა, ამიტომ ასოთა
+        -- დიაპაზონები ორივე რეგისტრით წერია ([A-Za-z]) და არა [A-Z]-ით.
+        --
         -- nv = ნორმალიზებული მნიშვნელობა: მოშორებულია გამყოფები, რომლითაც
         -- ციფრულ ფორმატებს რეალურ ბაზებში წერენ —
         --   ტელეფონი „555 12 34 56", „(555) 12-34-56", „+995 555 123456"
@@ -311,13 +366,15 @@ BEGIN
                                    AND v LIKE ''[0-9]%[0-9]''
                                   THEN 1 ELSE 0 END),
               @h_plate = SUM(CASE WHEN LEN(nv)=7
-                                   AND nv LIKE ''[A-Z][A-Z][0-9][0-9][0-9][A-Z][A-Z]''
+                                   AND nv LIKE ''[A-Za-z][A-Za-z][0-9][0-9][0-9][A-Za-z][A-Za-z]''
                                    THEN 1 ELSE 0 END),
               @h_mail  = SUM(CASE WHEN v LIKE ''%_@_%.__%'' AND v NOT LIKE ''% %'' THEN 1 ELSE 0 END),
               -- nv-ზე: IBAN-ს ბლოკებად წერენ — ''GE29 NB00 0000 0101 9049 17''
-              @h_iban  = SUM(CASE WHEN LEN(nv)=22 AND nv LIKE ''GE[0-9][0-9][A-Z][A-Z]%'' THEN 1 ELSE 0 END),
+              @h_iban  = SUM(CASE WHEN LEN(nv)=22
+                                   AND nv LIKE ''[Gg][Ee][0-9][0-9][A-Za-z][A-Za-z]%''
+                                  THEN 1 ELSE 0 END),
               -- ტექსტში ჩადგმული: მთელი მნიშვნელობა კი არა, მისი ნაწილი ემთხვევა
-              @h_emb_mail  = SUM(CASE WHEN v LIKE ''%[a-z0-9]@[a-z0-9]%.[a-z][a-z]%''
+              @h_emb_mail  = SUM(CASE WHEN v LIKE ''%[A-Za-z0-9]@[A-Za-z0-9]%.[A-Za-z][A-Za-z]%''
                                       THEN 1 ELSE 0 END),
               @h_emb_phone = SUM(CASE WHEN is_dec = 0
                                        AND nv LIKE ''%5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]%''
@@ -335,7 +392,8 @@ BEGIN
                             THEN 1 ELSE 0 END AS is_dec
                 FROM (
                     SELECT TOP (' + CAST(@SampleSize AS NVARCHAR(10)) + N')
-                           LTRIM(RTRIM(CONVERT(NVARCHAR(4000), ' + QUOTENAME(@cln) + N'))) AS v
+                           LTRIM(RTRIM(CONVERT(NVARCHAR(4000), ' + QUOTENAME(@cln) + N')))
+                               COLLATE Latin1_General_BIN2 AS v
                     FROM ' + QUOTENAME(@sch) + N'.' + QUOTENAME(@tbl) + N' WITH (NOLOCK)
                     WHERE ' + QUOTENAME(@cln) + N' IS NOT NULL
                 ) y
@@ -356,7 +414,11 @@ BEGIN
                  @h_ip=@h_ip OUTPUT;
         END TRY
         BEGIN CATCH
-            SET @n = 0;   -- უფლების ან ტიპის პრობლემა — გამოვტოვოთ სვეტი
+            -- უფლების ან ტიპის პრობლემა. სვეტს ვტოვებთ, მაგრამ ჩუმად აღარ —
+            -- გამოტოვებული სვეტი ანგარიშში ცალკე გამოდის.
+            SET @n = 0;
+            INSERT INTO #skipped (schema_name, table_name, column_name, reason, err)
+            VALUES (@sch, @tbl, @cln, N'ERROR', LEFT(ERROR_MESSAGE(), 400));
         END CATCH
 
         IF ISNULL(@n,0) > 0
@@ -417,18 +479,24 @@ WHERE c.name_category IS NOT NULL
   AND c.name_confidence >= @MinNameConfidence;
 
 --------------------------------------------------------------------------------
+-- 6a. აღმოჩენების დედუპლიკაცია
+--     ერთი მწკრივი = ერთი სვეტი + ერთი კატეგორია, მიუხედავად იმისა, სახელით
+--     მოიძებნა, მონაცემით თუ ორივეთი. სამივე ანგარიში ამ ცხრილიდან იკითხება.
+--------------------------------------------------------------------------------
+INSERT INTO #agg (schema_name, table_name, column_name, data_type, approx_rows,
+                  category, by_name, by_data, hit_pct, conf, is_special)
+SELECT schema_name, table_name, column_name, data_type, approx_rows, category,
+       MAX(CASE WHEN detected_by = 'NAME' THEN 1 ELSE 0 END),
+       MAX(CASE WHEN detected_by = 'DATA' THEN 1 ELSE 0 END),
+       MAX(hit_pct),
+       MAX(confidence),
+       MAX(CAST(is_special AS INT))
+FROM #find
+GROUP BY schema_name, table_name, column_name, data_type, approx_rows, category;
+
+--------------------------------------------------------------------------------
 -- 7. შედეგი #1 — კონსოლიდირებული აღმოჩენები
 --------------------------------------------------------------------------------
-;WITH agg AS (
-    SELECT schema_name, table_name, column_name, data_type, approx_rows, category,
-           MAX(CASE WHEN detected_by = 'NAME' THEN 1 ELSE 0 END) AS by_name,
-           MAX(CASE WHEN detected_by = 'DATA' THEN 1 ELSE 0 END) AS by_data,
-           MAX(hit_pct)    AS hit_pct,
-           MAX(confidence) AS conf,
-           MAX(CAST(is_special AS INT)) AS is_special
-    FROM #find
-    GROUP BY schema_name, table_name, column_name, data_type, approx_rows, category
-)
 SELECT
     N'1. აღმოჩენები' AS [ანგარიში],
     a.schema_name AS [სქემა], a.table_name AS [ცხრილი], a.column_name AS [სვეტი],
@@ -446,7 +514,7 @@ SELECT
     CASE WHEN c.is_likely_fk = 1 AND a.by_data = 0
          THEN N'სავარაუდოდ FK — შეამოწმე ხელით'
          ELSE N'' END AS [შენიშვნა]
-FROM agg a
+FROM #agg a
 LEFT JOIN #col c
        ON c.schema_name = a.schema_name
       AND c.table_name  = a.table_name
@@ -462,11 +530,12 @@ SELECT
     N'2. შეჯამება' AS [ანგარიში],
     category AS [კატეგორია],
     COUNT(DISTINCT schema_name + '.' + table_name) AS [ცხრილი],
-    COUNT(DISTINCT column_name) AS [სვეტი],
-    SUM(CAST(is_special AS INT)) AS [სპეციალური]
-FROM #find
+    -- სვეტი სრული გზით ითვლება: ორ სხვადასხვა ცხრილში `email` ორია, არა ერთი
+    COUNT(DISTINCT schema_name + '.' + table_name + '.' + column_name) AS [სვეტი],
+    SUM(is_special) AS [სპეციალური]
+FROM #agg
 GROUP BY category
-ORDER BY [ცხრილი] DESC;
+ORDER BY [ცხრილი] DESC, [კატეგორია];
 
 --------------------------------------------------------------------------------
 -- 9. შედეგი #3 — RoPA-ს ნახევრადმზა სტრიქონები
@@ -477,18 +546,52 @@ SELECT
     schema_name + '.' + table_name AS [დამუშავების ობიექტი],
     STUFF((
         SELECT DISTINCT ', ' + f2.category
-        FROM #find f2
+        FROM #agg f2
         WHERE f2.schema_name = f.schema_name AND f2.table_name = f.table_name
+        ORDER BY ', ' + f2.category
         FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS [მონაცემთა კატეგორიები],
-    MAX(f.approx_rows) AS [სუბიექტი (მიახლ.)],
-    CASE WHEN MAX(CAST(f.is_special AS INT)) = 1
+    -- „ჩანაწერი" და არა „სუბიექტი": ტრანზაქციების ცხრილში 1M მწკრივი
+    -- შეიძლება 8000 ადამიანს ეხებოდეს. სუბიექტების რაოდენობა აქედან არ დგინდება.
+    MAX(f.approx_rows) AS [ჩანაწერი (მიახლ.)],
+    CASE WHEN MAX(f.is_special) = 1
          THEN N'საჭიროა გაძლიერებული საფუძველი + DPIA'
          ELSE N'სტანდარტული' END AS [შენიშვნა]
-FROM #find f
+FROM #agg f
 GROUP BY schema_name, table_name
-ORDER BY [სუბიექტი (მიახლ.)] DESC;
+ORDER BY [ჩანაწერი (მიახლ.)] DESC, [დამუშავების ობიექტი];
 
 --------------------------------------------------------------------------------
--- 10. დასუფთავება
+-- 10. შედეგი #4 — მოცვა
+--     აუდიტს სჭირდება მტკიცებულება იმისა, თუ რა შემოწმდა — არა მხოლოდ
+--     ის, რა მოიძებნა. ცარიელი შედეგი შეიძლება ნიშნავდეს „PII არ არის"
+--     ან „ვერ წავიკითხე"; ეს ორი აქ ერთმანეთისგან განირჩევა.
 --------------------------------------------------------------------------------
--- DROP TABLE #col; DROP TABLE #find;
+SELECT
+    N'4. მოცვა' AS [ანგარიში],
+    (SELECT COUNT(DISTINCT schema_name + '.' + table_name) FROM #col) AS [ცხრილი სულ],
+    (SELECT COUNT(*) FROM #col)                                       AS [სვეტი სულ],
+    (SELECT COUNT(*) FROM #col WHERE approx_rows = 0)                 AS [ცარიელი ცხრილი],
+    @scanned                                                          AS [დასკანერებული სვეტი],
+    (SELECT COUNT(*) FROM #skipped WHERE reason = N'COMPUTED')        AS [გამოტოვებული: გამოთვლადი],
+    (SELECT COUNT(*) FROM #skipped WHERE reason = N'ERROR')           AS [გამოტოვებული: შეცდომა],
+    CASE WHEN @ScanData = 0 THEN N'მონაცემი არ სკანირებულა (@ScanData = 0)'
+         WHEN EXISTS (SELECT 1 FROM #skipped WHERE reason = N'ERROR')
+              THEN N'⚠ ნაწილი სვეტებისა ვერ წაიკითხა — იხ. ანგარიში 5'
+         ELSE N'სრული' END AS [სტატუსი];
+
+--------------------------------------------------------------------------------
+-- 11. შედეგი #5 — გამოტოვებული სვეტები
+--------------------------------------------------------------------------------
+SELECT
+    N'5. გამოტოვებული' AS [ანგარიში],
+    schema_name AS [სქემა], table_name AS [ცხრილი], column_name AS [სვეტი],
+    CASE reason WHEN N'COMPUTED' THEN N'გამოთვლადი სვეტი'
+                ELSE N'შეცდომა' END AS [მიზეზი],
+    err AS [დეტალი]
+FROM #skipped
+ORDER BY reason, schema_name, table_name, column_name;
+
+--------------------------------------------------------------------------------
+-- 12. დასუფთავება
+--------------------------------------------------------------------------------
+-- DROP TABLE #col; DROP TABLE #find; DROP TABLE #agg; DROP TABLE #skipped;
