@@ -250,27 +250,39 @@ BEGIN
 
     WHILE @@FETCH_STATUS = 0
     BEGIN
+        -- nv = ნორმალიზებული მნიშვნელობა: მოშორებულია გამყოფები, რომლითაც
+        -- ციფრულ ფორმატებს რეალურ ბაზებში წერენ —
+        --   ტელეფონი „555 12 34 56", „(555) 12-34-56", „+995 555 123456"
+        --   პირადი ნომერი „01001 012345"
+        --   ბარათი „4111-1111-1111-1111"
+        -- ელფოსტასა და IBAN-ს nv არ ეხება: იქ წერტილი და შუალედი
+        -- თავად ფორმატის ნაწილია, არა შემთხვევითი გამყოფი.
         SET @sql = N'
             SELECT @n = COUNT(*),
-              @h_pid   = SUM(CASE WHEN LEN(v)=11 AND v NOT LIKE ''%[^0-9]%'' THEN 1 ELSE 0 END),
-              @h_phone = SUM(CASE WHEN (LEN(v)=9  AND v LIKE ''5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
-                                    OR (LEN(v)=12 AND v LIKE ''9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
-                                    OR (LEN(v)=13 AND v LIKE ''+9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
+              @h_pid   = SUM(CASE WHEN LEN(nv)=11 AND nv NOT LIKE ''%[^0-9]%'' THEN 1 ELSE 0 END),
+              @h_phone = SUM(CASE WHEN (LEN(nv)=9  AND nv LIKE ''5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
+                                    OR (LEN(nv)=12 AND nv LIKE ''9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
+                                    OR (LEN(nv)=13 AND nv LIKE ''+9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
+                                   THEN 1 ELSE 0 END),
+              @h_card  = SUM(CASE WHEN LEN(nv)=16 AND nv NOT LIKE ''%[^0-9]%''
+                                   AND LEFT(nv,1) IN (''4'',''5'',''6'') THEN 1 ELSE 0 END),
+              @h_plate = SUM(CASE WHEN LEN(nv)=7
+                                   AND nv LIKE ''[A-Z][A-Z][0-9][0-9][0-9][A-Z][A-Z]''
                                    THEN 1 ELSE 0 END),
               @h_mail  = SUM(CASE WHEN v LIKE ''%_@_%.__%'' AND v NOT LIKE ''% %'' THEN 1 ELSE 0 END),
-              @h_iban  = SUM(CASE WHEN LEN(v)=22 AND v LIKE ''GE[0-9][0-9][A-Z][A-Z]%'' THEN 1 ELSE 0 END),
-              @h_card  = SUM(CASE WHEN LEN(v)=16 AND v NOT LIKE ''%[^0-9]%''
-                                   AND LEFT(v,1) IN (''4'',''5'',''6'') THEN 1 ELSE 0 END),
-              @h_plate = SUM(CASE WHEN LEN(REPLACE(v,''-'','''')) = 7
-                                   AND REPLACE(v,''-'','''') LIKE ''[A-Z][A-Z][0-9][0-9][0-9][A-Z][A-Z]''
-                                   THEN 1 ELSE 0 END)
+              @h_iban  = SUM(CASE WHEN LEN(v)=22 AND v LIKE ''GE[0-9][0-9][A-Z][A-Z]%'' THEN 1 ELSE 0 END)
             FROM (
-                SELECT TOP (' + CAST(@SampleSize AS NVARCHAR(10)) + N')
-                       LTRIM(RTRIM(CONVERT(NVARCHAR(400), ' + QUOTENAME(@cln) + N'))) AS v
-                FROM ' + QUOTENAME(@sch) + N'.' + QUOTENAME(@tbl) + N' WITH (NOLOCK)
-                WHERE ' + QUOTENAME(@cln) + N' IS NOT NULL
-            ) x
-            WHERE v <> '''';';
+                SELECT v,
+                       REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                           v, '' '', ''''), ''-'', ''''), ''('', ''''), '')'', ''''), ''.'', '''') AS nv
+                FROM (
+                    SELECT TOP (' + CAST(@SampleSize AS NVARCHAR(10)) + N')
+                           LTRIM(RTRIM(CONVERT(NVARCHAR(400), ' + QUOTENAME(@cln) + N'))) AS v
+                    FROM ' + QUOTENAME(@sch) + N'.' + QUOTENAME(@tbl) + N' WITH (NOLOCK)
+                    WHERE ' + QUOTENAME(@cln) + N' IS NOT NULL
+                ) y
+                WHERE v <> ''''
+            ) x;';
 
         BEGIN TRY
             EXEC sp_executesql @sql,
