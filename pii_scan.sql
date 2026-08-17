@@ -438,22 +438,30 @@ BEGIN
                   AND REPLACE(r.v, ''-'', '''') NOT LIKE ''%[^0-9.]%''
              THEN 1 ELSE 0 END
     )) AS z(nv, is_dec)
-    CROSS APPLY (VALUES (
+    CROSS APPLY (
         -- Luhn (ISO/IEC 7812). მარჯვნიდან ყოველი მეორე ციფრი ორმაგდება;
         -- 9-ზე მეტი ჯამი 9-ით მცირდება; საბოლოო ჯამი 10-ზე უნდა იყოფოდეს.
         -- პოზიცია i მარცხნიდან ორმაგდება, როცა (LEN - i) კენტია.
         -- -1 = შემოწმება არ ჩატარებულა (არ არის 15/16 ციფრი), ანუ % 10 <> 0.
-        CASE WHEN LEN(z.nv) IN (15,16) AND z.nv NOT LIKE ''%[^0-9]%'' THEN (
-                SELECT SUM(CASE WHEN (LEN(z.nv) - p.i) % 2 = 1
-                                THEN CASE WHEN TRY_CAST(SUBSTRING(z.nv,p.i,1) AS INT) * 2 > 9
-                                          THEN TRY_CAST(SUBSTRING(z.nv,p.i,1) AS INT) * 2 - 9
-                                          ELSE TRY_CAST(SUBSTRING(z.nv,p.i,1) AS INT) * 2 END
-                                ELSE TRY_CAST(SUBSTRING(z.nv,p.i,1) AS INT) END)
-                FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),
-                             (9),(10),(11),(12),(13),(14),(15),(16)) p(i)
-                WHERE p.i <= LEN(z.nv) )
-             ELSE -1 END
-    )) AS l(luhn)
+        --
+        -- ციფრი, პოზიცია და სიგრძე ჯერ d-ში გადმოდის და მხოლოდ მერე ჯამდება.
+        -- პირდაპირ SUM(... z.nv ... p.i ...) Msg 8124-ს იძლევა: თუ აგრეგირებულ
+        -- გამოსახულებაში გარე მითითებაა, ის ერთადერთი სვეტი უნდა იყოს იქ.
+        -- გადმოტანა CROSS APPLY-ით ხდება და არა derived table-ით — derived
+        -- table გარე სვეტს ვერ ხედავს, APPLY კი სწორედ ამისთვისაა.
+        SELECT CASE WHEN LEN(z.nv) IN (15,16) AND z.nv NOT LIKE ''%[^0-9]%'' THEN (
+                    SELECT SUM(CASE WHEN (d.ln - d.i) % 2 = 1
+                                    THEN CASE WHEN d.dg * 2 > 9 THEN d.dg * 2 - 9
+                                              ELSE d.dg * 2 END
+                                    ELSE d.dg END)
+                    FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),
+                                 (9),(10),(11),(12),(13),(14),(15),(16)) p(i)
+                    CROSS APPLY (VALUES (
+                        p.i, LEN(z.nv), TRY_CAST(SUBSTRING(z.nv, p.i, 1) AS INT)
+                    )) d(i, ln, dg)
+                    WHERE p.i <= LEN(z.nv) )
+               ELSE -1 END AS luhn
+    ) AS l
     WHERE r.v IS NOT NULL AND r.v <> ''''
     GROUP BY r.colname;';
 
