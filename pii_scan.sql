@@ -36,6 +36,9 @@ SET NOCOUNT ON;
 --------------------------------------------------------------------------------
 -- 1. კონფიგურაცია
 --------------------------------------------------------------------------------
+DECLARE @SelfTest        BIT           = 0;     -- 1 = მხოლოდ თვითშემოწმება: ბაზას არ ეხება,
+                                                -- ცნობილ მნიშვნელობებს ატარებს იმავე პატერნებში
+                                                -- და მოსალოდნელს ადარებს. master-ზეც გადის.
 DECLARE @ScriptVersion   NVARCHAR(20)  = N'1.0.0';  -- აისახება ანგარიშ #0-ში
 DECLARE @SampleSize      INT           = 500;   -- რამდენი მწკრივი თითო სვეტზე
 DECLARE @MinHitPct       DECIMAL(5,2)  = 5.00;  -- ზღვარი: მაჩვენებელი ამაზე ქვემოთ იგნორდება
@@ -156,8 +159,111 @@ CREATE TABLE #skipped (
 );
 
 --------------------------------------------------------------------------------
--- 3. სვეტების ინვენტარიზაცია
+-- 2a. შემოწმებების განსაზღვრება
+--     ერთხელ იწერება და სამ ადგილას გამოიყენება: სწრაფ რეჟიმში, ნელ რეჟიმში
+--     და თვითშემოწმებაში. სწორედ ამიტომ ამოწმებს თვითშემოწმება იმას, რასაც
+--     რეალური სკანირება აკეთებს — და არა მის ასლს.
+--
+--     r.v      — საწყისი მნიშვნელობა (COLLATE Latin1_General_BIN2)
+--     z.nv     — ნორმალიზებული: მოშორებულია ' ', '-', '(', ')', '.'
+--     z.is_dec — სუფთა ათწილადი, ციფრულ ფორმატებში არ ითვლება
+--     l.luhn   — Luhn-ის ჯამი, ან -1 თუ არ ჩატარებულა
 --------------------------------------------------------------------------------
+DECLARE @checks NVARCHAR(MAX) = N'
+  SUM(CASE WHEN z.is_dec = 0 AND LEN(z.nv)=11
+            AND z.nv NOT LIKE ''%[^0-9]%'' THEN 1 ELSE 0 END),
+  SUM(CASE WHEN z.is_dec = 0
+            AND (   (LEN(z.nv)=9  AND z.nv LIKE ''5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
+                 OR (LEN(z.nv)=12 AND z.nv LIKE ''9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
+                 OR (LEN(z.nv)=13 AND z.nv LIKE ''+9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'') )
+           THEN 1 ELSE 0 END),
+  SUM(CASE WHEN z.is_dec = 0
+            AND (   (LEN(z.nv)=9  AND z.nv LIKE ''322[0-9][0-9][0-9][0-9][0-9][0-9]'')
+                 OR (LEN(z.nv)=10 AND z.nv LIKE ''0322[0-9][0-9][0-9][0-9][0-9][0-9]'')
+                 OR (LEN(z.nv)=12 AND z.nv LIKE ''995322[0-9][0-9][0-9][0-9][0-9][0-9]'')
+                 OR (LEN(z.nv)=13 AND z.nv LIKE ''+995322[0-9][0-9][0-9][0-9][0-9][0-9]'') )
+           THEN 1 ELSE 0 END),
+  SUM(CASE WHEN r.v LIKE ''%_@_%.__%'' AND r.v NOT LIKE ''% %'' THEN 1 ELSE 0 END),
+  SUM(CASE WHEN LEN(z.nv)=22
+            AND z.nv LIKE ''[Gg][Ee][0-9][0-9][A-Za-z][A-Za-z]%'' THEN 1 ELSE 0 END),
+  SUM(CASE WHEN z.is_dec = 0 AND z.nv NOT LIKE ''%[^0-9]%''
+            AND (   (LEN(z.nv)=16 AND LEFT(z.nv,1) IN (''4'',''5'',''6''))
+                 OR (LEN(z.nv)=15 AND LEFT(z.nv,2) IN (''34'',''37'')) )
+            AND l.luhn % 10 = 0
+           THEN 1 ELSE 0 END),
+  SUM(CASE WHEN LEN(z.nv)=7
+            AND z.nv LIKE ''[A-Za-z][A-Za-z][0-9][0-9][0-9][A-Za-z][A-Za-z]''
+           THEN 1 ELSE 0 END),
+  -- IPv4. PARSENAME ოთხ ნაწილად ჭრის და თითოეული 0-255 უნდა იყოს:
+  -- ეს `10.0.19041.1` ტიპის build-ნომრებს აცილებს. `17.0.0.0` ვერსია
+  -- ფორმატით რეალურ IP-სგან განურჩეველია — იქ ნიმუშის ზღვარი მუშაობს.
+  SUM(CASE WHEN LEN(r.v) BETWEEN 7 AND 15
+            AND r.v NOT LIKE ''%[^0-9.]%''
+            AND LEN(r.v) - LEN(REPLACE(r.v, ''.'', '''')) = 3
+            AND r.v LIKE ''[0-9]%[0-9]''
+            AND TRY_CAST(PARSENAME(r.v, 1) AS INT) BETWEEN 0 AND 255
+            AND TRY_CAST(PARSENAME(r.v, 2) AS INT) BETWEEN 0 AND 255
+            AND TRY_CAST(PARSENAME(r.v, 3) AS INT) BETWEEN 0 AND 255
+            AND TRY_CAST(PARSENAME(r.v, 4) AS INT) BETWEEN 0 AND 255
+           THEN 1 ELSE 0 END),
+  SUM(CASE WHEN r.v LIKE ''%[A-Za-z0-9]@[A-Za-z0-9]%.[A-Za-z][A-Za-z]%''
+           THEN 1 ELSE 0 END),
+  SUM(CASE WHEN z.is_dec = 0
+            AND z.nv LIKE ''%5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]%''
+           THEN 1 ELSE 0 END)';
+DECLARE @norm NVARCHAR(MAX) = N'
+CROSS APPLY (VALUES (
+    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+        r.v, '' '', ''''), ''-'', ''''), ''('', ''''), '')'', ''''), ''.'', ''''),
+    CASE WHEN LEN(r.v) - LEN(REPLACE(r.v, ''.'', '''')) = 1
+              AND r.v NOT LIKE ''%-%-%''
+              AND REPLACE(r.v, ''-'', '''') NOT LIKE ''%[^0-9.]%''
+         THEN 1 ELSE 0 END
+)) AS z(nv, is_dec)
+CROSS APPLY (
+    -- Luhn (ISO/IEC 7812). მარჯვნიდან ყოველი მეორე ციფრი ორმაგდება;
+    -- 9-ზე მეტი ჯამი 9-ით მცირდება; საბოლოო ჯამი 10-ზე უნდა იყოფოდეს.
+    -- პოზიცია i მარცხნიდან ორმაგდება, როცა (LEN - i) კენტია.
+    -- -1 = შემოწმება არ ჩატარებულა (არ არის 15/16 ციფრი), ანუ % 10 <> 0.
+    --
+    -- ციფრი, პოზიცია და სიგრძე ჯერ d-ში გადმოდის და მხოლოდ მერე ჯამდება.
+    -- პირდაპირ SUM(... z.nv ... p.i ...) Msg 8124-ს იძლევა: თუ აგრეგირებულ
+    -- გამოსახულებაში გარე მითითებაა, ის ერთადერთი სვეტი უნდა იყოს იქ.
+    -- გადმოტანა CROSS APPLY-ით ხდება და არა derived table-ით — derived
+    -- table გარე სვეტს ვერ ხედავს, APPLY კი სწორედ ამისთვისაა.
+    SELECT CASE WHEN LEN(z.nv) IN (15,16) AND z.nv NOT LIKE ''%[^0-9]%'' THEN (
+                SELECT SUM(CASE WHEN (d.ln - d.i) % 2 = 1
+                                THEN CASE WHEN d.dg * 2 > 9 THEN d.dg * 2 - 9
+                                          ELSE d.dg * 2 END
+                                ELSE d.dg END)
+                FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),
+                             (9),(10),(11),(12),(13),(14),(15),(16)) p(i)
+                CROSS APPLY (VALUES (
+                    p.i, LEN(z.nv), TRY_CAST(SUBSTRING(z.nv, p.i, 1) AS INT)
+                )) d(i, ln, dg)
+                WHERE p.i <= LEN(z.nv) )
+           ELSE -1 END AS luhn
+) AS l
+WHERE r.v IS NOT NULL AND r.v <> ''''
+GROUP BY r.colname;';
+
+--------------------------------------------------------------------------------
+-- 3. სვეტების ინვენტარიზაცია
+--
+--    თვითშემოწმებისას რეალური სვეტების ნაცვლად ცნობილი სახელები ჩაიწერება,
+--    რომ მე-4 სექციამ ისინი ჩვეულებრივად დაამუშაოს. პატერნების სია არსად
+--    დუბლირდება — შემოწმება ნამდვილ ცხრილს ეყრდნობა.
+--------------------------------------------------------------------------------
+IF @SelfTest = 1
+    INSERT INTO #col (schema_name, table_name, column_name, data_type, max_length,
+                      approx_rows, is_text, is_numeric_id, is_likely_fk, is_computed)
+    SELECT N'TEST', N'TEST', v.nm, N'nvarchar', 200, 0, 1, 0, 0, 0
+    FROM (VALUES
+        (N'sexual_orientation'), (N'Gender'), (N'Sex'), (N'citizenship'),
+        (N'nationality'), (N'IPAddress'), (N'ip_addr'), (N'imei'),
+        (N'health_icd_code'), (N'email'), (N'gvari'), (N'nasamartloba')
+    ) v(nm);
+ELSE
 INSERT INTO #col (schema_name, table_name, column_name, data_type, max_length,
                   approx_rows, is_text, is_numeric_id, is_likely_fk, is_computed)
 SELECT
@@ -326,6 +432,170 @@ FROM #col c
 JOIN best b ON b.col_id = c.col_id AND b.rn = 1;
 
 --------------------------------------------------------------------------------
+-- 4a. თვითშემოწმება
+--
+--     ცნობილ მნიშვნელობებს ატარებს იმავე @checks / @norm გამოსახულებებში,
+--     რომლებსაც რეალური სკანირება იყენებს, და შედეგს მოსალოდნელს ადარებს.
+--     ბაზას არ ეხება — master-ზეც გადის.
+--
+--     ორივე ეტაპი იფარება: სახელების პატერნები (მე-4 სექციამ უკვე დაამუშავა
+--     #col-ის სატესტო მწკრივები) და მონაცემის შემოწმებები.
+--------------------------------------------------------------------------------
+IF @SelfTest = 1
+BEGIN
+    IF OBJECT_ID('tempdb..#t_data') IS NOT NULL DROP TABLE #t_data;
+    CREATE TABLE #t_data (
+        id      INT,
+        val     NVARCHAR(200),
+        expect  NVARCHAR(100),   -- რომელი მრიცხველები უნდა გაისროლოს, რიგზე
+        note    NVARCHAR(100)
+    );
+
+    -- მრიცხველების რიგი: pid, phone, land, mail, iban, card, plate, ip, emb_mail, emb_phone
+    INSERT INTO #t_data (id, val, expect, note) VALUES
+    ( 1, N'599123456',                   N'phone,emb_phone', N'მობილური, სუფთა'),
+    ( 2, N'599 12 34 56',                N'phone,emb_phone', N'მობილური, გამყოფებით'),
+    ( 3, N'+995 599 123456',             N'phone,emb_phone', N'მობილური, საერთაშორისო'),
+    ( 4, N'322123456',                   N'land',            N'სტაციონარული, თბილისი'),
+    ( 5, N'01001012345',                 N'pid',             N'პირადი ნომერი, 11 ციფრი'),
+    ( 6, N'4111-1111-1111-1111',         N'card',            N'Visa, Luhn ✓'),
+    ( 7, N'4111111111111112',            N'',                N'Luhn ✗ — არ უნდა დაიჭიროს'),
+    ( 8, N'378282246310005',             N'card',            N'Amex 15 ციფრი, Luhn ✓'),
+    ( 9, N'GE29 NB00 0000 0101 9049 17', N'iban',            N'IBAN, ბლოკებად'),
+    (10, N'nika@example.ge',             N'mail,emb_mail',   N'ელფოსტა'),
+    (11, N'AA123BB',                     N'plate',           N'სახელმწიფო ნომერი'),
+    (12, N'5123456.78',                  N'',                N'ათწილადი — არა ტელეფონი'),
+    (13, N'10.0.19041.1',                N'',                N'build-ნომერი — ოქტეტი >255'),
+    (14, N'17.0.0.0',                    N'ip',              N'ვერსია — ფორმატით IP-ის იდენტური'),
+    (15, N'192.168.1.1',                 N'ip',              N'რეალური IPv4'),
+    (16, N'დაგვიკავშირდით 599123456-ზე', N'emb_phone',       N'ტელეფონი ტექსტში');
+
+    DECLARE @tsql NVARCHAR(MAX), @tvals NVARCHAR(MAX);
+
+    SET @tvals = STUFF((
+        SELECT N',(N' + QUOTENAME(CAST(t.id AS NVARCHAR(10)), '''')
+             + N', N' + QUOTENAME(t.val, '''') + N' COLLATE Latin1_General_BIN2)'
+        FROM #t_data t ORDER BY t.id
+        FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 1, '');
+
+    SET @tsql = N'SELECT N''TEST'', N''TEST'', r.colname, COUNT(*),' + @checks
+              + N' FROM (VALUES ' + @tvals + N') AS r(colname, v)'
+              + @norm;
+
+    INSERT INTO #hits (schema_name, table_name, column_name, n,
+                       h_pid, h_phone, h_land, h_mail, h_iban,
+                       h_card, h_plate, h_ip, h_emb_mail, h_emb_phone)
+    EXEC sp_executesql @tsql;
+
+    ----------------------------------------------------------------------------
+    -- შედეგი: მონაცემის შემოწმებები
+    ----------------------------------------------------------------------------
+    SELECT
+        N'T1. მონაცემი' AS [შემოწმება],
+        t.id            AS [#],
+        t.val           AS [მნიშვნელობა],
+        t.note          AS [აღწერა],
+        t.expect        AS [მოსალოდნელი],
+        a.actual        AS [მიღებული],
+        CASE WHEN a.actual = t.expect THEN N'PASS' ELSE N'✗ FAIL' END AS [შედეგი]
+    FROM #t_data t
+    LEFT JOIN #hits h ON h.column_name = CAST(t.id AS NVARCHAR(10))
+    CROSS APPLY (VALUES (ISNULL(STUFF(
+          CASE WHEN h.h_pid       > 0 THEN N',pid'       ELSE N'' END
+        + CASE WHEN h.h_phone     > 0 THEN N',phone'     ELSE N'' END
+        + CASE WHEN h.h_land      > 0 THEN N',land'      ELSE N'' END
+        + CASE WHEN h.h_mail      > 0 THEN N',mail'      ELSE N'' END
+        + CASE WHEN h.h_iban      > 0 THEN N',iban'      ELSE N'' END
+        + CASE WHEN h.h_card      > 0 THEN N',card'      ELSE N'' END
+        + CASE WHEN h.h_plate     > 0 THEN N',plate'     ELSE N'' END
+        + CASE WHEN h.h_ip        > 0 THEN N',ip'        ELSE N'' END
+        + CASE WHEN h.h_emb_mail  > 0 THEN N',emb_mail'  ELSE N'' END
+        + CASE WHEN h.h_emb_phone > 0 THEN N',emb_phone' ELSE N'' END
+        , 1, 1, ''), N''))) a(actual)
+    ORDER BY CASE WHEN a.actual = t.expect THEN 1 ELSE 0 END, t.id;
+
+    ----------------------------------------------------------------------------
+    -- შედეგი: სახელების პატერნები.
+    -- სპეციალური კატეგორიის სისწორე აქ მოწმდება — სწორედ ის, რაც ერთხელ
+    -- უკვე გატყდა (LIKE N'%⚠%' ყველა კატეგორიას ემთხვეოდა).
+    ----------------------------------------------------------------------------
+    SELECT
+        N'T2. სახელი' AS [შემოწმება],
+        e.nm          AS [სვეტის სახელი],
+        e.cat         AS [მოსალოდნელი კატეგორია],
+        c.name_category AS [მიღებული],
+        e.sp          AS [მოსალოდნელი სპეც.],
+        c.name_is_special AS [მიღებული სპეც.],
+        CASE WHEN c.name_category = e.cat AND c.name_is_special = e.sp
+             THEN N'PASS' ELSE N'✗ FAIL' END AS [შედეგი]
+    FROM (VALUES
+        (N'sexual_orientation', N'სენსიტიური ⚠',          1),
+        (N'Gender',             N'სქესი',                 0),
+        (N'Sex',                N'სქესი',                 0),
+        (N'citizenship',        N'მოქალაქეობა',           0),
+        (N'nationality',        N'მოქალაქეობა',           0),
+        (N'IPAddress',          N'ონლაინ იდენტიფიკატორი',  0),
+        (N'ip_addr',            N'ონლაინ იდენტიფიკატორი',  0),
+        (N'imei',               N'ონლაინ იდენტიფიკატორი',  0),
+        (N'health_icd_code',    N'ჯანმრთელობა ⚠',         1),
+        (N'email',              N'ელფოსტა',               0),
+        (N'gvari',              N'სახელი/გვარი',          0),
+        (N'nasamartloba',       N'სენსიტიური ⚠',          1)
+    ) e(nm, cat, sp)
+    LEFT JOIN #col c ON c.column_name = e.nm
+    ORDER BY CASE WHEN c.name_category = e.cat AND c.name_is_special = e.sp
+                  THEN 1 ELSE 0 END, e.nm;
+
+    ----------------------------------------------------------------------------
+    -- შედეგი: შეჯამება
+    ----------------------------------------------------------------------------
+    DECLARE @fail INT = (
+        SELECT COUNT(*) FROM #t_data t
+        LEFT JOIN #hits h ON h.column_name = CAST(t.id AS NVARCHAR(10))
+        CROSS APPLY (VALUES (ISNULL(STUFF(
+              CASE WHEN h.h_pid       > 0 THEN N',pid'       ELSE N'' END
+            + CASE WHEN h.h_phone     > 0 THEN N',phone'     ELSE N'' END
+            + CASE WHEN h.h_land      > 0 THEN N',land'      ELSE N'' END
+            + CASE WHEN h.h_mail      > 0 THEN N',mail'      ELSE N'' END
+            + CASE WHEN h.h_iban      > 0 THEN N',iban'      ELSE N'' END
+            + CASE WHEN h.h_card      > 0 THEN N',card'      ELSE N'' END
+            + CASE WHEN h.h_plate     > 0 THEN N',plate'     ELSE N'' END
+            + CASE WHEN h.h_ip        > 0 THEN N',ip'        ELSE N'' END
+            + CASE WHEN h.h_emb_mail  > 0 THEN N',emb_mail'  ELSE N'' END
+            + CASE WHEN h.h_emb_phone > 0 THEN N',emb_phone' ELSE N'' END
+            , 1, 1, ''), N''))) a(actual)
+        WHERE a.actual <> t.expect )
+      + (SELECT COUNT(*) FROM (VALUES
+            (N'sexual_orientation', N'სენსიტიური ⚠',          1),
+            (N'Gender',             N'სქესი',                 0),
+            (N'Sex',                N'სქესი',                 0),
+            (N'citizenship',        N'მოქალაქეობა',           0),
+            (N'nationality',        N'მოქალაქეობა',           0),
+            (N'IPAddress',          N'ონლაინ იდენტიფიკატორი',  0),
+            (N'ip_addr',            N'ონლაინ იდენტიფიკატორი',  0),
+            (N'imei',               N'ონლაინ იდენტიფიკატორი',  0),
+            (N'health_icd_code',    N'ჯანმრთელობა ⚠',         1),
+            (N'email',              N'ელფოსტა',               0),
+            (N'gvari',              N'სახელი/გვარი',          0),
+            (N'nasamartloba',       N'სენსიტიური ⚠',          1)
+         ) e(nm, cat, sp)
+         LEFT JOIN #col c ON c.column_name = e.nm
+         WHERE c.name_category IS NULL OR c.name_category <> e.cat
+            OR c.name_is_special <> e.sp );
+
+    SELECT
+        N'T0. შეჯამება' AS [შემოწმება],
+        @ScriptVersion  AS [სკრიპტის ვერსია],
+        (SELECT COUNT(*) FROM #t_data) + 12 AS [სულ],
+        @fail                               AS [ჩავარდნილი],
+        CASE WHEN @fail = 0 THEN N'ყველა შემოწმება გავიდა'
+             ELSE N'✗ არის ჩავარდნილი შემოწმება — იხ. T1 / T2' END AS [სტატუსი];
+
+    DROP TABLE #t_data;
+    RETURN;
+END
+
+--------------------------------------------------------------------------------
 -- 5. ეტაპი 2 — მონაცემის შერჩევითი სკანირება
 --
 --    ერთი გავლა ცხრილზე, არა ერთი გავლა სვეტზე. სვეტები CROSS APPLY (VALUES ...)
@@ -394,90 +664,7 @@ BEGIN
     WHERE c.to_scan = 1
     GROUP BY c.schema_name, c.table_name;
 
-    ----------------------------------------------------------------------------
-    -- შემოწმებების სია ერთხელ იწერება და ორივე რეჟიმში იგივეა.
-    -- r.v  — საწყისი მნიშვნელობა (COLLATE Latin1_General_BIN2)
-    -- z.nv — ნორმალიზებული: მოშორებულია ' ', '-', '(', ')', '.'
-    -- z.is_dec — სუფთა ათწილადი, ციფრულ ფორმატებში არ ითვლება
-    ----------------------------------------------------------------------------
-    DECLARE @checks NVARCHAR(MAX) = N'
-      SUM(CASE WHEN z.is_dec = 0 AND LEN(z.nv)=11
-                AND z.nv NOT LIKE ''%[^0-9]%'' THEN 1 ELSE 0 END),
-      SUM(CASE WHEN z.is_dec = 0
-                AND (   (LEN(z.nv)=9  AND z.nv LIKE ''5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
-                     OR (LEN(z.nv)=12 AND z.nv LIKE ''9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'')
-                     OR (LEN(z.nv)=13 AND z.nv LIKE ''+9955[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'') )
-               THEN 1 ELSE 0 END),
-      SUM(CASE WHEN z.is_dec = 0
-                AND (   (LEN(z.nv)=9  AND z.nv LIKE ''322[0-9][0-9][0-9][0-9][0-9][0-9]'')
-                     OR (LEN(z.nv)=10 AND z.nv LIKE ''0322[0-9][0-9][0-9][0-9][0-9][0-9]'')
-                     OR (LEN(z.nv)=12 AND z.nv LIKE ''995322[0-9][0-9][0-9][0-9][0-9][0-9]'')
-                     OR (LEN(z.nv)=13 AND z.nv LIKE ''+995322[0-9][0-9][0-9][0-9][0-9][0-9]'') )
-               THEN 1 ELSE 0 END),
-      SUM(CASE WHEN r.v LIKE ''%_@_%.__%'' AND r.v NOT LIKE ''% %'' THEN 1 ELSE 0 END),
-      SUM(CASE WHEN LEN(z.nv)=22
-                AND z.nv LIKE ''[Gg][Ee][0-9][0-9][A-Za-z][A-Za-z]%'' THEN 1 ELSE 0 END),
-      SUM(CASE WHEN z.is_dec = 0 AND z.nv NOT LIKE ''%[^0-9]%''
-                AND (   (LEN(z.nv)=16 AND LEFT(z.nv,1) IN (''4'',''5'',''6''))
-                     OR (LEN(z.nv)=15 AND LEFT(z.nv,2) IN (''34'',''37'')) )
-                AND l.luhn % 10 = 0
-               THEN 1 ELSE 0 END),
-      SUM(CASE WHEN LEN(z.nv)=7
-                AND z.nv LIKE ''[A-Za-z][A-Za-z][0-9][0-9][0-9][A-Za-z][A-Za-z]''
-               THEN 1 ELSE 0 END),
-      -- IPv4. PARSENAME ოთხ ნაწილად ჭრის და თითოეული 0-255 უნდა იყოს:
-      -- ეს `10.0.19041.1` ტიპის build-ნომრებს აცილებს. `17.0.0.0` ვერსია
-      -- ფორმატით რეალურ IP-სგან განურჩეველია — იქ ნიმუშის ზღვარი მუშაობს.
-      SUM(CASE WHEN LEN(r.v) BETWEEN 7 AND 15
-                AND r.v NOT LIKE ''%[^0-9.]%''
-                AND LEN(r.v) - LEN(REPLACE(r.v, ''.'', '''')) = 3
-                AND r.v LIKE ''[0-9]%[0-9]''
-                AND TRY_CAST(PARSENAME(r.v, 1) AS INT) BETWEEN 0 AND 255
-                AND TRY_CAST(PARSENAME(r.v, 2) AS INT) BETWEEN 0 AND 255
-                AND TRY_CAST(PARSENAME(r.v, 3) AS INT) BETWEEN 0 AND 255
-                AND TRY_CAST(PARSENAME(r.v, 4) AS INT) BETWEEN 0 AND 255
-               THEN 1 ELSE 0 END),
-      SUM(CASE WHEN r.v LIKE ''%[A-Za-z0-9]@[A-Za-z0-9]%.[A-Za-z][A-Za-z]%''
-               THEN 1 ELSE 0 END),
-      SUM(CASE WHEN z.is_dec = 0
-                AND z.nv LIKE ''%5[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]%''
-               THEN 1 ELSE 0 END)';
 
-    DECLARE @norm NVARCHAR(MAX) = N'
-    CROSS APPLY (VALUES (
-        REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
-            r.v, '' '', ''''), ''-'', ''''), ''('', ''''), '')'', ''''), ''.'', ''''),
-        CASE WHEN LEN(r.v) - LEN(REPLACE(r.v, ''.'', '''')) = 1
-                  AND r.v NOT LIKE ''%-%-%''
-                  AND REPLACE(r.v, ''-'', '''') NOT LIKE ''%[^0-9.]%''
-             THEN 1 ELSE 0 END
-    )) AS z(nv, is_dec)
-    CROSS APPLY (
-        -- Luhn (ISO/IEC 7812). მარჯვნიდან ყოველი მეორე ციფრი ორმაგდება;
-        -- 9-ზე მეტი ჯამი 9-ით მცირდება; საბოლოო ჯამი 10-ზე უნდა იყოფოდეს.
-        -- პოზიცია i მარცხნიდან ორმაგდება, როცა (LEN - i) კენტია.
-        -- -1 = შემოწმება არ ჩატარებულა (არ არის 15/16 ციფრი), ანუ % 10 <> 0.
-        --
-        -- ციფრი, პოზიცია და სიგრძე ჯერ d-ში გადმოდის და მხოლოდ მერე ჯამდება.
-        -- პირდაპირ SUM(... z.nv ... p.i ...) Msg 8124-ს იძლევა: თუ აგრეგირებულ
-        -- გამოსახულებაში გარე მითითებაა, ის ერთადერთი სვეტი უნდა იყოს იქ.
-        -- გადმოტანა CROSS APPLY-ით ხდება და არა derived table-ით — derived
-        -- table გარე სვეტს ვერ ხედავს, APPLY კი სწორედ ამისთვისაა.
-        SELECT CASE WHEN LEN(z.nv) IN (15,16) AND z.nv NOT LIKE ''%[^0-9]%'' THEN (
-                    SELECT SUM(CASE WHEN (d.ln - d.i) % 2 = 1
-                                    THEN CASE WHEN d.dg * 2 > 9 THEN d.dg * 2 - 9
-                                              ELSE d.dg * 2 END
-                                    ELSE d.dg END)
-                    FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),
-                                 (9),(10),(11),(12),(13),(14),(15),(16)) p(i)
-                    CROSS APPLY (VALUES (
-                        p.i, LEN(z.nv), TRY_CAST(SUBSTRING(z.nv, p.i, 1) AS INT)
-                    )) d(i, ln, dg)
-                    WHERE p.i <= LEN(z.nv) )
-               ELSE -1 END AS luhn
-    ) AS l
-    WHERE r.v IS NOT NULL AND r.v <> ''''
-    GROUP BY r.colname;';
 
     DECLARE @sch SYSNAME, @tbl SYSNAME, @ordc SYSNAME, @tbl_id INT;
     DECLARE @sql NVARCHAR(MAX), @cols NVARCHAR(MAX), @src NVARCHAR(MAX);

@@ -110,6 +110,7 @@ sqlcmd -S servername -d YourDatabase -i pii_scan.sql -o result.txt
 | `@MinHitPct` | 5.00 | პროცენტული ზღვარი |
 | `@MinAbsHits` | 3 | აბსოლუტური ზღვარი — ამდენი დამთხვევა პროცენტის მიუხედავად აისახება |
 | `@MinSampleForPct` | 10 | პროცენტული წესი მხოლოდ ამ ზომის ნიმუშიდან მოქმედებს |
+| `@SelfTest` | 0 | 1 = მხოლოდ თვითშემოწმება, ბაზას არ ეხება |
 | `@ScanData` | 1 | 0 = მხოლოდ სახელების ანალიზი (წამები) |
 | `@ScanAllStringCols` | 1 | 0 = მხოლოდ სახელით ნაპოვნი სვეტები |
 | `@MaxColumnsToScan` | 3000 | დაცვა დიდ ბაზებზე |
@@ -119,6 +120,18 @@ sqlcmd -S servername -d YourDatabase -i pii_scan.sql -o result.txt
 ზღვრები **ან**-ით მუშაობს: შედეგი აისახება, თუ პროცენტიც აკმაყოფილებს **ან** აბსოლუტური რაოდენობაც. პროცენტულ წესს `@MinSampleForPct` იცავს — ერთმწკრივიან ცხრილში „100%" არაფერს ნიშნავს. კომპლაიენსში მნიშვნელოვანია არსებობა და არა გავრცელება — 500-დან 10 IBAN ეს 2%-ია, მაგრამ უკვე ინციდენტი. `@MinAbsHits = 0` ამ ქცევას გამორთავს.
 
 `@MinNameConfidence` მხოლოდ **სახელით** ნაპოვნს ფილტრავს — მონაცემით დადასტურებული აღმოჩენა ყოველთვის რჩება. ნაგულისხმევი 50 ორ ყველაზე ხმაურიან პატერნს ჩუმდება: `%pers%id%` (იჭერს `PersonID`-ს ისევე, როგორც `personal_id`-ს) და `%photo%` (პროდუქტის ფოტოსაც). თუ სრული აუდიტი გინდა და false positive-ები არ გაწუხებს, დააყენე `0`.
+
+### თვითშემოწმება
+
+`@SelfTest = 1` სკანირების ნაცვლად **ცნობილ მნიშვნელობებს ატარებს იმავე პატერნებში** და შედეგს მოსალოდნელს ადარებს. ბაზას საერთოდ არ ეხება — `master`-ზეც გადის, წამზე ნაკლებში.
+
+```
+28 შემოწმება — 16 მონაცემის ფორმატზე, 12 სვეტის სახელზე
+```
+
+მნიშვნელოვანია, რომ შემოწმება **იმავე** `@checks` და `@norm` გამოსახულებებს იყენებს, რომლებსაც რეალური სკანირება, ხოლო სახელების ტესტი — იმავე პატერნების ცხრილს. ანუ ის ამოწმებს ნამდვილ კოდს და არა მის ასლს.
+
+გაუშვი ყოველი ცვლილების შემდეგ. ორივე ბაგი, რომელიც ამ სკრიპტს რეალურ გაშვებაზე დაემართა — `LIKE N'%⚠%'`-ის ყოვლისმომცველი დამთხვევა და Luhn-ის `Msg 8124` — ამ შემოწმებით წამებში დაიჭირებოდა.
 
 ### უფლებები
 
@@ -214,6 +227,7 @@ Useful knobs at the top of the file:
 | `@MinHitPct` | 5.00 | percentage threshold |
 | `@MinAbsHits` | 3 | absolute threshold — this many matches report regardless of percentage |
 | `@MinSampleForPct` | 10 | the percentage rule only applies to samples at least this large |
+| `@SelfTest` | 0 | 1 = run the self-test only; touches no database |
 | `@ScanData` | 1 | 0 = name heuristics only, which takes seconds |
 | `@MaxColumnsToScan` | 3000 | guard for very large databases |
 | `@FastMode` | 1 | 1 = one query per table; 0 = one per column, slower but isolates failures |
