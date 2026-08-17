@@ -36,8 +36,12 @@ SET NOCOUNT ON;
 --------------------------------------------------------------------------------
 -- 1. კონფიგურაცია
 --------------------------------------------------------------------------------
+DECLARE @ScriptVersion   NVARCHAR(20)  = N'1.0.0';  -- აისახება ანგარიშ #0-ში
 DECLARE @SampleSize      INT           = 500;   -- რამდენი მწკრივი თითო სვეტზე
 DECLARE @MinHitPct       DECIMAL(5,2)  = 5.00;  -- ზღვარი: მაჩვენებელი ამაზე ქვემოთ იგნორდება
+DECLARE @MinSampleForPct INT           = 10;    -- პროცენტული წესი მხოლოდ ამ ზომის ნიმუშიდან
+                                                -- მოქმედებს. ერთმწკრივიან ცხრილში „100%" 
+                                                -- არაფერს ნიშნავს — ვერსიის ნომერი IP-დ ითვლებოდა.
 DECLARE @MinAbsHits      INT           = 3;     -- აბსოლუტური ზღვარი: ამდენი დამთხვევა ყოველთვის
                                                 -- აისახება, პროცენტის მიუხედავად. კომპლაიენსში
                                                 -- მნიშვნელოვანია არსებობა, არა გავრცელება —
@@ -74,6 +78,7 @@ CREATE TABLE #col (
     is_numeric_id   BIT,
     is_likely_fk    BIT,          -- ციფრული სვეტი, სახელი ბოლოვდება „id"-ით
     is_computed     BIT,          -- გამოთვლადი: სახელით მოწმდება, მონაცემით არა
+    is_eligible     BIT           NOT NULL DEFAULT 0,   -- სასკანერო კრიტერიუმი, ერთხელ გამოთვლილი
     to_scan         BIT           NOT NULL DEFAULT 0,
     name_category   NVARCHAR(40)  NULL,
     name_confidence TINYINT       NOT NULL DEFAULT 0,
@@ -334,26 +339,27 @@ DECLARE @scanned INT = 0;
 
 IF @ScanData = 1
 BEGIN
+    -- სასკანერო კრიტერიუმი ერთხელ იწერება და ერთ ფლაგში ინახება.
+    -- ორ ადგილას დუბლირება ნიშნავდა, რომ პირობის შეცვლისას მოცვის რიცხვები
+    -- ჩუმად აცდებოდა აღმოჩენებს.
+    UPDATE #col
+       SET is_eligible = CASE WHEN approx_rows > 0
+                               AND (   (is_text = 1 AND @ScanAllStringCols = 1)
+                                    OR name_category IS NOT NULL
+                                    OR is_numeric_id = 1 )
+                              THEN 1 ELSE 0 END;
+
     -- გამოთვლადი სვეტი მონაცემით არ სკანირდება: თითო მწკრივზე გამოსახულების
     -- იძულებით გამოთვლას ნიშნავს. სახელის ევრისტიკა მასზე მაინც მუშაობს.
     INSERT INTO #skipped (schema_name, table_name, column_name, reason, err)
     SELECT schema_name, table_name, column_name, N'COMPUTED',
            N'გამოთვლადი სვეტი — მონაცემი არ წაკითხულა'
     FROM #col
-    WHERE is_computed = 1
-      AND approx_rows > 0
-      AND (   (is_text = 1 AND @ScanAllStringCols = 1)
-           OR name_category IS NOT NULL
-           OR is_numeric_id = 1 );
+    WHERE is_eligible = 1 AND is_computed = 1;
 
-    -- სასკანერო სვეტების მონიშვნა (იგივე პირობა, ერთხელ)
     UPDATE #col
        SET to_scan = 1
-     WHERE approx_rows > 0
-       AND is_computed = 0
-       AND (   (is_text = 1 AND @ScanAllStringCols = 1)
-            OR name_category IS NOT NULL
-            OR is_numeric_id = 1 );
+     WHERE is_eligible = 1 AND is_computed = 0;
 
     -- @MaxColumnsToScan-ის ზღვარი. დალაგება დეტერმინირებულია, რომ ზღვარზე
     -- ყოველთვის ერთი და იგივე ნაკრები მოხვდეს.
@@ -419,10 +425,18 @@ BEGIN
       SUM(CASE WHEN LEN(z.nv)=7
                 AND z.nv LIKE ''[A-Za-z][A-Za-z][0-9][0-9][0-9][A-Za-z][A-Za-z]''
                THEN 1 ELSE 0 END),
+      -- IPv4. PARSENAME ოთხ ნაწილად ჭრის და თითოეული 0-255 უნდა იყოს:
+      -- ეს `10.0.19041.1` ტიპის build-ნომრებს აცილებს. `17.0.0.0` ვერსია
+      -- ფორმატით რეალურ IP-სგან განურჩეველია — იქ ნიმუშის ზღვარი მუშაობს.
       SUM(CASE WHEN LEN(r.v) BETWEEN 7 AND 15
                 AND r.v NOT LIKE ''%[^0-9.]%''
                 AND LEN(r.v) - LEN(REPLACE(r.v, ''.'', '''')) = 3
-                AND r.v LIKE ''[0-9]%[0-9]'' THEN 1 ELSE 0 END),
+                AND r.v LIKE ''[0-9]%[0-9]''
+                AND TRY_CAST(PARSENAME(r.v, 1) AS INT) BETWEEN 0 AND 255
+                AND TRY_CAST(PARSENAME(r.v, 2) AS INT) BETWEEN 0 AND 255
+                AND TRY_CAST(PARSENAME(r.v, 3) AS INT) BETWEEN 0 AND 255
+                AND TRY_CAST(PARSENAME(r.v, 4) AS INT) BETWEEN 0 AND 255
+               THEN 1 ELSE 0 END),
       SUM(CASE WHEN r.v LIKE ''%[A-Za-z0-9]@[A-Za-z0-9]%.[A-Za-z][A-Za-z]%''
                THEN 1 ELSE 0 END),
       SUM(CASE WHEN z.is_dec = 0
@@ -621,7 +635,10 @@ BEGIN
          ) d(cat, hits)
     WHERE h.n > 0
       AND d.hits > 0
-      AND (   100.0 * d.hits / h.n >= @MinHitPct
+      -- პროცენტული წესი მხოლოდ საკმარისად დიდ ნიმუშზე ენდობა. ერთმწკრივიან
+      -- ცხრილში ერთი დამთხვევა „100%"-ია და ყოველთვის გაივლიდა — სწორედ ასე
+      -- ხვდებოდა ანგარიშში `AWBuildVersion.Database Version` IP მისამართად.
+      AND (   (h.n >= @MinSampleForPct AND 100.0 * d.hits / h.n >= @MinHitPct)
            OR d.hits >= @MinAbsHits );
 END
 --------------------------------------------------------------------------------
@@ -655,6 +672,29 @@ SELECT schema_name, table_name, column_name, data_type, approx_rows, category,
        MAX(CAST(is_special AS INT))
 FROM #find
 GROUP BY schema_name, table_name, column_name, data_type, approx_rows, category;
+
+--------------------------------------------------------------------------------
+-- 6b. შედეგი #0 — გაშვების წარმომავლობა
+--     აღმოჩენების სია მტკიცებულებაა მხოლოდ მაშინ, თუ ცნობილია რა, სად, როდის
+--     და რომელი პარამეტრებით შემოწმდა. ეს მწკრივი ანგარიშთან ერთად ინახება.
+--------------------------------------------------------------------------------
+SELECT
+    N'0. გაშვება' AS [ანგარიში],
+    @@SERVERNAME AS [სერვერი],
+    DB_NAME()    AS [ბაზა],
+    CONVERT(NVARCHAR(19), SYSDATETIME(), 120) AS [დრო],
+    @ScriptVersion AS [სკრიპტის ვერსია],
+    SUSER_SNAME() AS [მომხმარებელი],
+    N'SampleSize='        + CAST(@SampleSize        AS NVARCHAR(10))
+  + N'; MinHitPct='       + CAST(@MinHitPct         AS NVARCHAR(10))
+  + N'; MinSampleForPct=' + CAST(@MinSampleForPct   AS NVARCHAR(10))
+  + N'; MinAbsHits='      + CAST(@MinAbsHits        AS NVARCHAR(10))
+  + N'; ScanData='        + CAST(@ScanData          AS NVARCHAR(1))
+  + N'; ScanAllStringCols=' + CAST(@ScanAllStringCols AS NVARCHAR(1))
+  + N'; MaxColumnsToScan=' + CAST(@MaxColumnsToScan AS NVARCHAR(10))
+  + N'; FastMode='        + CAST(@FastMode          AS NVARCHAR(1))
+  + N'; MinNameConfidence=' + CAST(@MinNameConfidence AS NVARCHAR(10))
+    AS [კონფიგურაცია];
 
 --------------------------------------------------------------------------------
 -- 7. შედეგი #1 — კონსოლიდირებული აღმოჩენები

@@ -31,7 +31,7 @@
 | IBAN | `GE` + 2 ციფრი + 2 ასო, სულ 22 სიმბოლო (შუალედები დასაშვებია) |
 | ბარათი | 16 ციფრი 4/5/6-ით, ან 15 ციფრი 34/37-ით (Amex) — **+ Luhn** |
 | სახ. ნომერი | `AA000AA` |
-| IP მისამართი | IPv4 — მხოლოდ ციფრი და სამი წერტილი |
+| IP მისამართი | IPv4 — სამი წერტილი, თითო ოქტეტი 0-255 |
 | ელფოსტა (ტექსტში) | ჩადგმული `%x@y.zz%` — მხოლოდ გრძელ სვეტებში |
 | ტელეფონი (ტექსტში) | ჩადგმული `5XXXXXXXX` — მხოლოდ გრძელ სვეტებში |
 
@@ -51,8 +51,9 @@
 
 ## შედეგი
 
-ხუთი ცხრილი:
+ექვსი ცხრილი:
 
+0. **გაშვება** — სერვერი, ბაზა, დრო, სკრიპტის ვერსია, მომხმარებელი და ყველა პარამეტრი, რომლითაც შედეგი მიღებულია
 1. **აღმოჩენები** — სქემა / ცხრილი / სვეტი / კატეგორია / დარწმუნების ხარისხი / რისკი / შენიშვნა
 2. **შეჯამება** — რამდენ ცხრილშია თითო კატეგორია
 3. **RoPA დრაფტი** — ცხრილი → მონაცემთა კატეგორიების სია, დამუშავების აღრიცხვის რეესტრისთვის
@@ -108,13 +109,14 @@ sqlcmd -S servername -d YourDatabase -i pii_scan.sql -o result.txt
 | `@SampleSize` | 500 | მწკრივი თითო სვეტზე |
 | `@MinHitPct` | 5.00 | პროცენტული ზღვარი |
 | `@MinAbsHits` | 3 | აბსოლუტური ზღვარი — ამდენი დამთხვევა პროცენტის მიუხედავად აისახება |
+| `@MinSampleForPct` | 10 | პროცენტული წესი მხოლოდ ამ ზომის ნიმუშიდან მოქმედებს |
 | `@ScanData` | 1 | 0 = მხოლოდ სახელების ანალიზი (წამები) |
 | `@ScanAllStringCols` | 1 | 0 = მხოლოდ სახელით ნაპოვნი სვეტები |
 | `@MaxColumnsToScan` | 3000 | დაცვა დიდ ბაზებზე |
 | `@FastMode` | 1 | 1 = ერთი მოთხოვნა ცხრილზე; 0 = ერთი მოთხოვნა სვეტზე |
 | `@MinNameConfidence` | 50 | ზღვარი სახელების ეტაპზე; `0` = ყველაფერი გამოჩნდეს |
 
-ორი ზღვარი **ან**-ით მუშაობს: შედეგი აისახება, თუ პროცენტიც აკმაყოფილებს **ან** აბსოლუტური რაოდენობაც. კომპლაიენსში მნიშვნელოვანია არსებობა და არა გავრცელება — 500-დან 10 IBAN ეს 2%-ია, მაგრამ უკვე ინციდენტი. `@MinAbsHits = 0` ამ ქცევას გამორთავს.
+ზღვრები **ან**-ით მუშაობს: შედეგი აისახება, თუ პროცენტიც აკმაყოფილებს **ან** აბსოლუტური რაოდენობაც. პროცენტულ წესს `@MinSampleForPct` იცავს — ერთმწკრივიან ცხრილში „100%" არაფერს ნიშნავს. კომპლაიენსში მნიშვნელოვანია არსებობა და არა გავრცელება — 500-დან 10 IBAN ეს 2%-ია, მაგრამ უკვე ინციდენტი. `@MinAbsHits = 0` ამ ქცევას გამორთავს.
 
 `@MinNameConfidence` მხოლოდ **სახელით** ნაპოვნს ფილტრავს — მონაცემით დადასტურებული აღმოჩენა ყოველთვის რჩება. ნაგულისხმევი 50 ორ ყველაზე ხმაურიან პატერნს ჩუმდება: `%pers%id%` (იჭერს `PersonID`-ს ისევე, როგორც `personal_id`-ს) და `%photo%` (პროდუქტის ფოტოსაც). თუ სრული აუდიტი გინდა და false positive-ები არ გაწუხებს, დააყენე `0`.
 
@@ -190,7 +192,9 @@ Sampling is pinned to `Latin1_General_BIN2`, so the same database gives the same
 
 ### Output
 
-Five result sets: findings, a per-category summary, a draft Record of Processing Activities (RoPA), a coverage report, and a list of skipped columns. The first three are built from one deduplicated set, so they cannot contradict each other.
+Six result sets: a run header, findings, a per-category summary, a draft Record of Processing Activities (RoPA), a coverage report, and a list of skipped columns. Findings, summary and RoPA are built from one deduplicated set, so they cannot contradict each other.
+
+The run header records the server, database, timestamp, script version and every parameter the scan used. A findings list is only evidence if you can say what it was produced from.
 
 The coverage report exists for auditors. An empty result can mean "no PII here" or "I could not read it" — coverage tells you which, listing every column that was skipped and why. Evidence of what was checked matters as much as the findings themselves.
 
@@ -209,6 +213,7 @@ Useful knobs at the top of the file:
 | `@SampleSize` | 500 | rows sampled per table |
 | `@MinHitPct` | 5.00 | percentage threshold |
 | `@MinAbsHits` | 3 | absolute threshold — this many matches report regardless of percentage |
+| `@MinSampleForPct` | 10 | the percentage rule only applies to samples at least this large |
 | `@ScanData` | 1 | 0 = name heuristics only, which takes seconds |
 | `@MaxColumnsToScan` | 3000 | guard for very large databases |
 | `@FastMode` | 1 | 1 = one query per table; 0 = one per column, slower but isolates failures |
